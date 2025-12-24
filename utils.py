@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 工具函数模块
-包含日志、指标计算、模型保存加载等功能
+包含日志、指标计算、模型保存加载、绘图等功能
 """
 
 import os
@@ -10,10 +10,19 @@ import logging
 import random
 import numpy as np
 import torch
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 from scipy.stats import pearsonr, ConstantInputWarning, NearConstantInputWarning
+
+# 尝试导入绘图库
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # 使用非交互式后端，支持无头服务器
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 
 def setup_seed(seed: int = 42):
@@ -105,10 +114,17 @@ class MetricsCalculator:
         corr, _ = pearsonr(y_pred, y_true)
         
         # 二分类指标（情感极性）
-        y_pred_binary = (y_pred >= 0).astype(int)
-        y_true_binary = (y_true >= 0).astype(int)
-        acc_2 = accuracy_score(y_true_binary, y_pred_binary)
-        f1_2 = f1_score(y_true_binary, y_pred_binary, average='weighted')
+        # 注意：此函数用于通用回归任务（如MOSI/MOSEI），默认剔除中性样本
+        # 对于CH-SIMS数据集，请使用 calc_chsims_metrics 函数
+        non_zeros = np.abs(y_true) > 1e-6  # 剔除标签为0的样本（MOSI/MOSEI标准做法）
+        if non_zeros.sum() > 0:
+            y_pred_binary = (y_pred[non_zeros] > 0).astype(int)
+            y_true_binary = (y_true[non_zeros] > 0).astype(int)
+            acc_2 = accuracy_score(y_true_binary, y_pred_binary)
+            f1_2 = f1_score(y_true_binary, y_pred_binary, average='weighted')
+        else:
+            acc_2 = 0.0
+            f1_2 = 0.0
         
         # 七分类指标（细粒度情感）
         def to_7class(scores):
@@ -134,7 +150,8 @@ class MetricsCalculator:
         }
     
     @staticmethod
-    def calc_chsims_metrics(y_pred: np.ndarray, y_true: np.ndarray, debug=False) -> Dict[str, float]:
+    def calc_chsims_metrics(y_pred: np.ndarray, y_true: np.ndarray, debug=False, 
+                            exclude_zero_for_binary=False) -> Dict[str, float]:
         """
         计算CH-SIMS特定的指标
         
@@ -149,6 +166,9 @@ class MetricsCalculator:
             y_pred: 预测值 [N]
             y_true: 真实值 [N]
             debug: 是否打印调试信息
+            exclude_zero_for_binary: 是否在计算Acc-2时剔除中性样本（label=0）
+                - False（默认）：CH-SIMS官方做法，使用 >=0 作为阈值，0归为正类
+                - True：MOSI/MOSEI风格，剔除中性样本
         Returns:
             metrics: 包含 MAE, Corr, Acc_2, Acc_3, Acc_5, F1 等指标
         """
@@ -163,6 +183,7 @@ class MetricsCalculator:
             print(f"  预测值中的中性样本: {neutral_pred}/{len(y_pred)} ({neutral_pred/len(y_pred)*100:.1f}%)")
             print(f"  预测值范围: [{y_pred.min():.3f}, {y_pred.max():.3f}]")
             print(f"  真实标签范围: [{y_true.min():.3f}, {y_true.max():.3f}]")
+            print(f"  Acc-2评估模式: {'MOSI风格(剔除中性)' if exclude_zero_for_binary else 'CH-SIMS风格(包含中性)'}")
         
         # 计算相关系数，处理常量输入的情况
         try:
@@ -178,13 +199,24 @@ class MetricsCalculator:
             corr = 0.0
         
         # 二分类（正/负）
-        def to_2class(scores):
-            return (scores >= 0).astype(int)
-        
-        y_pred_2 = to_2class(y_pred)
-        y_true_2 = to_2class(y_true)
-        acc_2 = accuracy_score(y_true_2, y_pred_2)
-        f1_2 = f1_score(y_true_2, y_pred_2, average='weighted')
+        if exclude_zero_for_binary:
+            # MOSI/MOSEI风格：剔除中性样本（标签为0的样本）
+            # 使用 > 0 而不是 >= 0
+            non_zeros = np.abs(y_true) > 1e-6
+            if non_zeros.sum() > 0:
+                y_pred_2 = (y_pred[non_zeros] > 0).astype(int)
+                y_true_2 = (y_true[non_zeros] > 0).astype(int)
+                acc_2 = accuracy_score(y_true_2, y_pred_2)
+                f1_2 = f1_score(y_true_2, y_pred_2, average='weighted')
+            else:
+                acc_2 = 0.0
+                f1_2 = 0.0
+        else:
+            # CH-SIMS官方风格：不剔除中性样本，>=0 归为正类
+            y_pred_2 = (y_pred >= 0).astype(int)
+            y_true_2 = (y_true >= 0).astype(int)
+            acc_2 = accuracy_score(y_true_2, y_pred_2)
+            f1_2 = f1_score(y_true_2, y_pred_2, average='weighted')
         
         # 三分类（负/中/正）
         def to_3class(scores):
@@ -512,4 +544,323 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+class MetricsHistory:
+    """用于记录训练过程中的指标历史"""
+    
+    def __init__(self):
+        self.history = {
+            'train': {},
+            'valid': {},
+            'test': {}
+        }
+    
+    def update(self, split: str, epoch: int, metrics: Dict[str, float]):
+        """
+        更新指标历史
+        
+        Args:
+            split: 数据集划分 ('train', 'valid', 'test')
+            epoch: 当前epoch
+            metrics: 指标字典
+        """
+        for key, value in metrics.items():
+            if key not in self.history[split]:
+                self.history[split][key] = []
+            self.history[split][key].append((epoch, value))
+    
+    def get_metric_values(self, split: str, metric_name: str) -> tuple:
+        """
+        获取指定指标的历史值
+        
+        Returns:
+            (epochs, values): epoch列表和对应的值列表
+        """
+        if metric_name not in self.history[split]:
+            return [], []
+        
+        data = self.history[split][metric_name]
+        epochs = [d[0] for d in data]
+        values = [d[1] for d in data]
+        return epochs, values
+    
+    def save_to_json(self, save_path: str):
+        """保存历史记录到JSON文件"""
+        # 转换为可序列化的格式
+        serializable_history = {}
+        for split, metrics in self.history.items():
+            serializable_history[split] = {}
+            for metric_name, data in metrics.items():
+                serializable_history[split][metric_name] = {
+                    'epochs': [d[0] for d in data],
+                    'values': [float(d[1]) if not np.isnan(d[1]) else None for d in data]
+                }
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_history, f, indent=2, ensure_ascii=False)
+
+
+class TrainingPlotter:
+    """训练过程绘图器"""
+    
+    # 指标配置：(显示名称, 是否越大越好)
+    METRIC_CONFIG = {
+        'MAE': ('MAE', False),
+        'mae': ('MAE', False),
+        'Acc_2': ('Acc-2 (Binary)', True),
+        'acc_2': ('Acc-2 (Binary)', True),
+        'Acc_3': ('Acc-3 (Ternary)', True),
+        'acc_3': ('Acc-3 (Ternary)', True),
+        'Acc_5': ('Acc-5 (5-Class)', True),
+        'acc_5': ('Acc-5 (5-Class)', True),
+        'loss': ('Loss', False),
+        'Corr': ('Correlation', True),
+        'corr': ('Correlation', True),
+        'F1_2': ('F1-2 (Binary)', True),
+        'F1_3': ('F1-3 (Ternary)', True),
+        'F1_5': ('F1-5 (5-Class)', True),
+    }
+    
+    # 绘图样式配置
+    SPLIT_STYLES = {
+        'train': {'color': '#2E86AB', 'linestyle': '-', 'marker': 'o', 'label': 'Train'},
+        'valid': {'color': '#A23B72', 'linestyle': '--', 'marker': 's', 'label': 'Valid'},
+        'test': {'color': '#F18F01', 'linestyle': '-.', 'marker': '^', 'label': 'Test'},
+    }
+    
+    def __init__(self, save_dir: str, logger=None):
+        """
+        初始化绘图器
+        
+        Args:
+            save_dir: 图片保存目录
+            logger: 日志记录器（可选）
+        """
+        self.save_dir = save_dir
+        self.logger = logger
+        self.figures_dir = os.path.join(save_dir, 'figures')
+        os.makedirs(self.figures_dir, exist_ok=True)
+    
+    def _log(self, message: str):
+        """记录日志"""
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(message)
+    
+    def plot_metric(self, 
+                    history: MetricsHistory, 
+                    metric_name: str,
+                    include_test: bool = True) -> Optional[str]:
+        """
+        绘制单个指标的训练曲线
+        
+        Args:
+            history: 指标历史记录
+            metric_name: 指标名称（如 'MAE', 'Acc_2', 'loss'）
+            include_test: 是否包含测试集曲线
+            
+        Returns:
+            保存的图片路径，如果绘制失败返回None
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            self._log("⚠️  matplotlib未安装，跳过绘图")
+            return None
+        
+        # 获取指标配置
+        display_name, higher_better = self.METRIC_CONFIG.get(
+            metric_name, (metric_name, False)
+        )
+        
+        # 收集数据
+        splits_to_plot = ['train', 'valid']
+        if include_test:
+            splits_to_plot.append('test')
+        
+        has_data = False
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        for split in splits_to_plot:
+            epochs, values = history.get_metric_values(split, metric_name)
+            if epochs and values:
+                has_data = True
+                style = self.SPLIT_STYLES[split]
+                ax.plot(epochs, values, 
+                       color=style['color'],
+                       linestyle=style['linestyle'],
+                       marker=style['marker'],
+                       markersize=4,
+                       linewidth=1.5,
+                       label=style['label'],
+                       alpha=0.8)
+        
+        if not has_data:
+            plt.close(fig)
+            return None
+        
+        # 设置图表样式
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel(display_name, fontsize=12)
+        ax.set_title(f'{display_name} vs Epoch', fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        
+        # 设置背景色
+        ax.set_facecolor('#f8f9fa')
+        fig.patch.set_facecolor('white')
+        
+        # 添加最佳值标注
+        for split in splits_to_plot:
+            epochs, values = history.get_metric_values(split, metric_name)
+            if epochs and values:
+                valid_values = [(e, v) for e, v in zip(epochs, values) if not np.isnan(v)]
+                if valid_values:
+                    if higher_better:
+                        best_idx = np.argmax([v for _, v in valid_values])
+                    else:
+                        best_idx = np.argmin([v for _, v in valid_values])
+                    best_epoch, best_value = valid_values[best_idx]
+                    style = self.SPLIT_STYLES[split]
+                    ax.annotate(f'{best_value:.4f}',
+                               xy=(best_epoch, best_value),
+                               xytext=(5, 5), textcoords='offset points',
+                               fontsize=8, color=style['color'],
+                               fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        save_path = os.path.join(self.figures_dir, f'{metric_name.lower()}_curve.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        self._log(f"✓ 已保存 {display_name} 曲线图: {save_path}")
+        return save_path
+    
+    def plot_all_metrics(self, 
+                         history: MetricsHistory,
+                         plot_config: Dict[str, bool],
+                         include_test: bool = True) -> Dict[str, str]:
+        """
+        根据配置绘制所有指标
+        
+        Args:
+            history: 指标历史记录
+            plot_config: 绘图配置，如 {'mae': True, 'acc_2': True, ...}
+            include_test: 是否包含测试集曲线
+            
+        Returns:
+            保存的图片路径字典
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            self._log("⚠️  matplotlib未安装，跳过所有绘图")
+            return {}
+        
+        saved_paths = {}
+        
+        # 指标名称映射（配置中的key -> 实际的指标名称）
+        metric_mapping = {
+            'mae': 'MAE',
+            'acc_2': 'Acc_2',
+            'acc_3': 'Acc_3',
+            'acc_5': 'Acc_5',
+            'loss': 'loss',
+            'corr': 'Corr',
+        }
+        
+        for config_key, should_plot in plot_config.items():
+            if should_plot:
+                metric_name = metric_mapping.get(config_key, config_key)
+                save_path = self.plot_metric(history, metric_name, include_test)
+                if save_path:
+                    saved_paths[config_key] = save_path
+        
+        return saved_paths
+    
+    def plot_combined_figure(self,
+                             history: MetricsHistory,
+                             plot_config: Dict[str, bool],
+                             include_test: bool = True) -> Optional[str]:
+        """
+        绘制组合图（所有指标在一个图中，使用子图）
+        
+        Args:
+            history: 指标历史记录
+            plot_config: 绘图配置
+            include_test: 是否包含测试集曲线
+            
+        Returns:
+            保存的图片路径
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            return None
+        
+        # 筛选需要绘制的指标
+        metrics_to_plot = [k for k, v in plot_config.items() if v]
+        if not metrics_to_plot:
+            return None
+        
+        # 指标名称映射
+        metric_mapping = {
+            'mae': 'MAE',
+            'acc_2': 'Acc_2',
+            'acc_3': 'Acc_3',
+            'acc_5': 'Acc_5',
+            'loss': 'loss',
+            'corr': 'Corr',
+        }
+        
+        n_metrics = len(metrics_to_plot)
+        n_cols = min(3, n_metrics)
+        n_rows = (n_metrics + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+        if n_metrics == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        splits_to_plot = ['train', 'valid']
+        if include_test:
+            splits_to_plot.append('test')
+        
+        for idx, config_key in enumerate(metrics_to_plot):
+            ax = axes[idx]
+            metric_name = metric_mapping.get(config_key, config_key)
+            display_name, _ = self.METRIC_CONFIG.get(metric_name, (metric_name, False))
+            
+            for split in splits_to_plot:
+                epochs, values = history.get_metric_values(split, metric_name)
+                if epochs and values:
+                    style = self.SPLIT_STYLES[split]
+                    ax.plot(epochs, values,
+                           color=style['color'],
+                           linestyle=style['linestyle'],
+                           marker=style['marker'],
+                           markersize=3,
+                           linewidth=1.2,
+                           label=style['label'],
+                           alpha=0.8)
+            
+            ax.set_xlabel('Epoch', fontsize=10)
+            ax.set_ylabel(display_name, fontsize=10)
+            ax.set_title(display_name, fontsize=11, fontweight='bold')
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_facecolor('#f8f9fa')
+        
+        # 隐藏多余的子图
+        for idx in range(n_metrics, len(axes)):
+            axes[idx].set_visible(False)
+        
+        fig.patch.set_facecolor('white')
+        plt.tight_layout()
+        
+        save_path = os.path.join(self.figures_dir, 'training_curves_combined.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        self._log(f"✓ 已保存组合曲线图: {save_path}")
+        return save_path
 

@@ -57,6 +57,7 @@ class BaseConfig:
         self.scheduler_step_size = 10
         self.scheduler_gamma = 0.5
         self.scheduler_patience = 5
+        self.warmup_ratio = 0.0  # 预热比例（0.0=关闭，0.1=前10%步数用于预热）
         
         # ===== 早停 =====
         self.early_stop_patience = 10  # 启用早停
@@ -83,6 +84,11 @@ class BaseConfig:
         
         # ===== 损失权重 =====
         self.sphere_loss_weight = 0.0  # 暂时关闭超球体正则化 ⭐
+        self.moe_loss_weight = 0.01    # ⭐ MoE负载均衡损失权重（防止专家坍缩）
+        
+        # ===== 课程学习 (Curriculum Learning) =====
+        self.curriculum_mode = 'none'  # 'none', 'freeze_backbone', 'alpha_blending'
+        self.curriculum_epochs = 5     # 课程学习持续的Epoch数
         
         # ===== 日志和保存 =====
         self.log_dir = f'./logs/{dataset_name}'
@@ -230,6 +236,15 @@ def get_config(dataset_name='chsims'):
                         choices=['mae', 'loss', 'acc_2', 'acc_3', 'acc_5', 'f1_2', 'f1_3', 'f1_5', 'corr', 'composite'],
                         help='早停监控指标（composite为综合指标：0.4*MAE + 0.3*Corr + 0.3*Acc5）')
     parser.add_argument('--sphere_loss_weight', type=float, default=None)
+    parser.add_argument('--moe_loss_weight', type=float, default=None,
+                        help='MoE负载均衡损失权重（默认：0.01，防止专家坍缩）')
+    
+    # ⭐ 课程学习参数
+    parser.add_argument('--curriculum_mode', type=str, default=None,
+                        choices=['none', 'freeze_backbone', 'alpha_blending'],
+                        help='课程学习模式：none=关闭，freeze_backbone=冻结骨干网络，alpha_blending=渐进式MoE混合')
+    parser.add_argument('--curriculum_epochs', type=int, default=None,
+                        help='课程学习持续的Epoch数（默认：5）')
     
     # MDP3参数（新的百分比模式）
     parser.add_argument('--n_segments', type=int, default=None,
@@ -300,6 +315,14 @@ def get_config(dataset_name='chsims'):
             config.metric_mode = 'max'  # 越大越好
     if args.sphere_loss_weight is not None:
         config.sphere_loss_weight = args.sphere_loss_weight
+    if args.moe_loss_weight is not None:
+        config.moe_loss_weight = args.moe_loss_weight
+    
+    # ⭐ 课程学习参数覆盖
+    if args.curriculum_mode is not None:
+        config.curriculum_mode = args.curriculum_mode
+    if args.curriculum_epochs is not None:
+        config.curriculum_epochs = args.curriculum_epochs
     
     # MDP3参数（新的百分比模式）
     if args.n_segments is not None:

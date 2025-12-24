@@ -188,6 +188,8 @@ class ModelConfig:
         
         # ⭐ MLP架构选择
         use_improved_mlp=False,  # True=改进版（4层深层），False=原始版（2层简单）
+        mlp_dropout=0.2,         # 改进版MLP的Dropout比例
+        mlp_expansion_ratio=4,   # 改进版MLP中间层扩维倍数
     ):
         self.use_key_frame_selector = use_key_frame_selector
         self.n_segments = n_segments
@@ -215,6 +217,8 @@ class ModelConfig:
         
         self.direct_fusion_priors = direct_fusion_priors
         self.use_improved_mlp = use_improved_mlp
+        self.mlp_dropout = mlp_dropout
+        self.mlp_expansion_ratio = mlp_expansion_ratio
 
 
 # ==================== 1. 关键帧选择模块 (参考MDP3) ====================
@@ -712,12 +716,34 @@ class FiLMExpert(nn.Module):
     """
     单个FiLM专家
     实现: modulation_product * x + modulation_add
+    
+    初始化策略（恒等映射）：
+    - expert_product: weight=0, bias=1 → 初始 Gamma=1
+    - expert_add: weight=0, bias=0 → 初始 Beta=0
+    - 初始状态: gamma * x + beta = 1 * x + 0 = x（恒等映射）
+    
+    这样在恢复训练时不会破坏已收敛的Mamba权重。
     """
     def __init__(self, dim: int):
         super().__init__()
         self.expert_product = nn.Linear(dim, dim)
         self.expert_add = nn.Linear(dim, dim)
         self.norm = nn.LayerNorm(dim)
+        
+        # ⭐ 恒等映射初始化：防止新模块破坏已收敛的Mamba权重
+        self._init_identity()
+    
+    def _init_identity(self):
+        """
+        初始化为恒等映射：gamma * x + beta = 1 * x + 0 = x
+        """
+        # Gamma 初始化：weight=0, bias=1 → Gamma = 0*x + 1 = 1
+        nn.init.zeros_(self.expert_product.weight)
+        nn.init.ones_(self.expert_product.bias)
+        
+        # Beta 初始化：weight=0, bias=0 → Beta = 0*x + 0 = 0
+        nn.init.zeros_(self.expert_add.weight)
+        nn.init.zeros_(self.expert_add.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, D] 或 [B, D]
@@ -730,6 +756,8 @@ class MoE_FiLM_Modulation(nn.Module):
     """
     MoE-FiLM调制模块 (参考MoFME)
     使用多个FiLM专家对模态特征进行调制
+    
+    ⭐ 包含负载均衡损失 (Load Balancing Loss) 以防止专家坍缩
     """
     def __init__(
         self,
@@ -777,11 +805,33 @@ class MoE_FiLM_Modulation(nn.Module):
             nn.GELU(),
         )
     
+    def _compute_load_balancing_loss(self, router_probs: torch.Tensor) -> torch.Tensor:
+        """
+        计算负载均衡损失，鼓励所有专家被均匀使用（防止专家坍缩）
+        
+        Args:
+            router_probs: [B, num_experts] Router 输出的概率分布
+        
+        Returns:
+            load_balancing_loss: 标量损失
+        """
+        # 计算每个专家在当前batch中被选择的平均概率
+        mean_probs = router_probs.mean(dim=0)  # [num_experts]
+        
+        # 理想情况：每个专家被均匀使用，概率 = 1/num_experts
+        target_prob = 1.0 / self.num_experts
+        
+        # 负载均衡损失：鼓励均匀分布
+        # 使用 MSE 并乘以 num_experts^2 使损失尺度与专家数量无关
+        load_balancing_loss = ((mean_probs - target_prob) ** 2).sum() * (self.num_experts ** 2)
+        
+        return load_balancing_loss
+    
     def forward(
         self,
         features: torch.Tensor,      # [B, T, D] 或 [B, D]
         condition: torch.Tensor,      # [B, D_cond]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             features: 待调制的特征
@@ -789,9 +839,13 @@ class MoE_FiLM_Modulation(nn.Module):
         Returns:
             modulated: 调制后的特征
             weights: 专家权重 [B, num_experts] (用于分析)
+            aux_loss: 负载均衡损失 (标量)
         """
         # 计算专家权重
         weights = self.router(condition)  # [B, num_experts]
+        
+        # ⭐ 计算负载均衡损失
+        aux_loss = self._compute_load_balancing_loss(weights)
         
         # Base transformation
         x = self.base_net(features)
@@ -813,7 +867,7 @@ class MoE_FiLM_Modulation(nn.Module):
         # 残差连接
         output = y + features
         
-        return output, weights
+        return output, weights, aux_loss
 
 
 # ==================== 3. Mamba相关模块 ====================
@@ -857,7 +911,16 @@ class MambaBlock(nn.Module):
 
 class CoupledMambaBlock(nn.Module):
     """
-    多模态耦合Mamba块 (保留原实现)
+    多模态耦合Mamba块 - Pre-Mamba交互版本
+    
+    核心思想：在将x送入Mamba之前，先进行一次轻量级跨模态融合。
+    这样Mamba看到的输入已经包含了多模态信息，从而间接实现状态耦合。
+    
+    流程：
+    1. Pre-Mamba交互：对于模态A，计算其他模态的特征均值作为context_A
+       x_A_new = x_A + α * context_A (α由先验门控控制)
+    2. Mamba时序建模：各模态通过自己的Mamba
+    3. 残差连接：output = mamba_out + x_original
     """
     def __init__(
         self,
@@ -874,6 +937,26 @@ class CoupledMambaBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_modalities = len(modality_names)
         
+        # ====== Pre-Mamba 跨模态融合模块 ======
+        # 轻量级投影：将其他模态的拼接特征投影到目标维度
+        self.pre_fusion_proj = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(hidden_dim * (self.num_modalities - 1), hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout_p),
+            ) for name in modality_names
+        })
+        
+        # 先验调制：控制跨模态信息的融合强度
+        self.prior_to_gate = nn.Sequential(
+            nn.Linear(prior_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim, self.num_modalities),
+        )
+        
+        # ====== Mamba 时序建模 ======
         # 每个模态独立的Mamba块
         self.modality_mambas = nn.ModuleDict({
             name: Mamba(
@@ -884,108 +967,8 @@ class CoupledMambaBlock(nn.Module):
             ) for name in modality_names
         })
         
-        # 跨模态增强模块
-        self.cross_modal_enhancers = nn.ModuleDict({
-            name: CrossModalEnhancer(
-                input_dim=hidden_dim * (self.num_modalities - 1),
-                output_dim=hidden_dim,
-                dropout_p=dropout_p,
-            ) for name in modality_names
-        })
-        
-        # 先验调制
-        self.prior_to_gate = nn.Sequential(
-            nn.Linear(prior_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(dropout_p),
-            nn.Linear(hidden_dim, self.num_modalities),
-        )
-        
-        self.dropout = nn.Dropout(dropout_p)
-    
-    def forward(
-        self,
-        modality_sequences: Dict[str, torch.Tensor],
-        prior_embedding: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            modality_sequences: 各模态序列
-            prior_embedding: 先验嵌入
-            mask: [B, T] 1=有效帧，0=padding帧 ⭐
-        """
-        batch_size = prior_embedding.size(0)
-        
-        # 1. 每个模态通过自己的Mamba
-        mamba_outputs = {}
-        for name in self.modality_names:
-            x = modality_sequences[name]
-            mamba_out = self.modality_mambas[name](x)
-            
-            # ⭐ 严格应用mask
-            if mask is not None:
-                mask_expanded = mask.unsqueeze(-1)  # [B, T, 1]
-                mamba_out = mamba_out * mask_expanded  # padding位置清零
-            
-            mamba_outputs[name] = mamba_out
-        
-        # 2. 根据先验生成模态权重
-        prior_embedding = safe_normalize(prior_embedding, dim=-1)  # ⭐ 修复：使用安全归一化
-        prior_gates = torch.sigmoid(self.prior_to_gate(prior_embedding))  # [B, M]
-        
-        # 3. 跨模态增强
-        updated = {}
-        for i, name in enumerate(self.modality_names):
-            other_modalities = [
-                mamba_outputs[other_name]
-                for other_name in self.modality_names
-                if other_name != name
-            ]
-            
-            other_concat = torch.cat(other_modalities, dim=-1)
-            cross_modal_info = self.cross_modal_enhancers[name](other_concat)
-            
-            gate_i = prior_gates[:, i].view(batch_size, 1, 1)
-            enhanced = gate_i * cross_modal_info + mamba_outputs[name]
-            enhanced = enhanced + modality_sequences[name]
-            enhanced = self.dropout(enhanced)
-            
-            # ⭐ 再次应用mask（防止残差连接引入padding信息）
-            if mask is not None:
-                mask_expanded = mask.unsqueeze(-1)  # [B, T, 1]
-                enhanced = enhanced * mask_expanded  # padding位置清零
-            
-            updated[name] = enhanced
-        
-        return updated
-
-
-class CoupledMambaStack(nn.Module):
-    """Coupled Mamba堆叠"""
-    def __init__(
-        self,
-        modality_names: List[str],
-        hidden_dim: int,
-        prior_dim: int,
-        num_layers: int,
-        dropout_p: float = 0.1,
-    ):
-        super().__init__()
-        self.modality_names = modality_names
-        self.num_layers = num_layers
-        
-        self.layers = nn.ModuleList([
-            CoupledMambaBlock(
-                modality_names=modality_names,
-                hidden_dim=hidden_dim,
-                prior_dim=prior_dim,
-                dropout_p=dropout_p,
-            )
-            for _ in range(num_layers)
-        ])
-        
-        self.layer_norms = nn.ModuleDict({
+        # 输出LayerNorm
+        self.output_norms = nn.ModuleDict({
             name: nn.LayerNorm(hidden_dim) for name in modality_names
         })
         
@@ -998,24 +981,141 @@ class CoupledMambaStack(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
+        Pre-Mamba交互的前向传播
+        
         Args:
-            modality_sequences: 各模态序列
-            prior_embedding: 先验嵌入
-            mask: [B, T] 1=有效帧，0=padding帧 ⭐
+            modality_sequences: 各模态序列 {name: [B, T, D]}
+            prior_embedding: 先验嵌入 [B, prior_dim]
+            mask: [B, T] 1=有效帧，0=padding帧
+        
+        Returns:
+            updated: 更新后的各模态序列 {name: [B, T, D]}
+        """
+        batch_size = prior_embedding.size(0)
+        
+        # ====== Step 1: 计算先验门控 ======
+        prior_embedding_norm = safe_normalize(prior_embedding, dim=-1)
+        prior_gates = torch.sigmoid(self.prior_to_gate(prior_embedding_norm))  # [B, M]
+        
+        # ====== Step 2: Pre-Mamba 跨模态融合 ======
+        # 对于每个模态，融合其他模态的信息作为上下文
+        fused_inputs = {}
+        for i, name in enumerate(self.modality_names):
+            x = modality_sequences[name]  # [B, T, D]
+            
+            # 收集其他模态的特征
+            other_modalities = [
+                modality_sequences[other_name]
+                for other_name in self.modality_names
+                if other_name != name
+            ]
+            
+            # 拼接其他模态特征并投影
+            other_concat = torch.cat(other_modalities, dim=-1)  # [B, T, D*(M-1)]
+            context = self.pre_fusion_proj[name](other_concat)  # [B, T, D]
+            
+            # 使用先验门控控制融合强度
+            gate_i = prior_gates[:, i].view(batch_size, 1, 1)  # [B, 1, 1]
+            
+            # 融合：x_new = x + gate * context
+            x_fused = x + gate_i * context
+            
+            # 应用mask（如果有）
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(-1)  # [B, T, 1]
+                x_fused = x_fused * mask_expanded
+            
+            fused_inputs[name] = x_fused
+        
+        # ====== Step 3: Mamba 时序建模 ======
+        mamba_outputs = {}
+        for name in self.modality_names:
+            x_fused = fused_inputs[name]
+            mamba_out = self.modality_mambas[name](x_fused)
+            
+            # 应用mask
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(-1)
+                mamba_out = mamba_out * mask_expanded
+            
+            mamba_outputs[name] = mamba_out
+        
+        # ====== Step 4: 残差连接 + LayerNorm ======
+        updated = {}
+        for name in self.modality_names:
+            # 残差连接：使用原始输入（不是fused的）
+            residual = modality_sequences[name]
+            output = mamba_outputs[name] + residual
+            output = self.dropout(output)
+            output = self.output_norms[name](output)
+            
+            # 最终mask应用
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(-1)
+                output = output * mask_expanded
+            
+            updated[name] = output
+        
+        return updated
+
+
+class CoupledMambaStack(nn.Module):
+    """
+    Coupled Mamba堆叠 - Pre-Mamba交互版本
+    
+    简化设计：每个CoupledMambaBlock内部已经包含了：
+    - Pre-Mamba跨模态融合
+    - Mamba时序建模
+    - 残差连接 + LayerNorm
+    
+    Stack只需要简单地堆叠多层即可。
+    """
+    def __init__(
+        self,
+        modality_names: List[str],
+        hidden_dim: int,
+        prior_dim: int,
+        num_layers: int,
+        dropout_p: float = 0.1,
+    ):
+        super().__init__()
+        self.modality_names = modality_names
+        self.num_layers = num_layers
+        
+        # 堆叠多层CoupledMambaBlock
+        self.layers = nn.ModuleList([
+            CoupledMambaBlock(
+                modality_names=modality_names,
+                hidden_dim=hidden_dim,
+                prior_dim=prior_dim,
+                dropout_p=dropout_p,
+            )
+            for _ in range(num_layers)
+        ])
+    
+    def forward(
+        self,
+        modality_sequences: Dict[str, torch.Tensor],
+        prior_embedding: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        多层Pre-Mamba交互的前向传播
+        
+        Args:
+            modality_sequences: 各模态序列 {name: [B, T, D]}
+            prior_embedding: 先验嵌入 [B, prior_dim]
+            mask: [B, T] 1=有效帧，0=padding帧
+        
+        Returns:
+            x: 更新后的各模态序列 {name: [B, T, D]}
         """
         x = modality_sequences
         
+        # 逐层通过CoupledMambaBlock
+        # 每层内部已经处理了残差连接和LayerNorm
         for layer in self.layers:
-            updated = layer(modality_sequences=x, prior_embedding=prior_embedding, mask=mask)
-            for name in self.modality_names:
-                res = x[name]
-                upd = self.dropout(updated[name])
-                x[name] = self.layer_norms[name](res + upd)
-                
-                # ⭐ 每层之后都应用mask（防止LayerNorm引入padding信息）
-                if mask is not None:
-                    mask_expanded = mask.unsqueeze(-1)  # [B, T, 1]
-                    x[name] = x[name] * mask_expanded  # padding位置清零
+            x = layer(modality_sequences=x, prior_embedding=prior_embedding, mask=mask)
         
         return x
 
@@ -1509,23 +1609,23 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         self.social_proj = nn.Linear(social_dim, hidden_dim)
         self.context_proj = nn.Linear(context_dim, hidden_dim)
         
-        # 2.5. 位置编码 (Sinusoidal Positional Encoding)
-        self.positional_encoding = SinusoidalPositionalEncoding(
-            d_model=hidden_dim,
-            max_len=5000,  # 支持最长5000帧
-            dropout=dropout_p,
+        # 2.5. 文本引导的去噪门控 (Text-Guided Gating)
+        # 用投影后的文本特征均值来"筛选"视听帧，抑制无关噪声
+        # 注意：使用hidden_dim作为输入，因为会从text_seq.mean()获取
+        self.audio_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.video_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
         )
         
-        # 2.6. 文本引导的软门控 (Text-Guided Gating)
-        # 用全局文本特征来预筛选音频和视频帧
-        self.text_guided_gate_audio = TextGuidedGating(
-            text_dim=text_global_dim,  # 使用原始text_global维度
-            target_dim=hidden_dim,
-            dropout=dropout_p,
-        )
-        self.text_guided_gate_video = TextGuidedGating(
-            text_dim=text_global_dim,
-            target_dim=hidden_dim,
+        # 2.6. 位置编码 (Sinusoidal Positional Encoding)
+        # 放在门控之后，确保位置信息在去噪后添加
+        self.pos_encoder = SinusoidalPositionalEncoding(
+            d_model=hidden_dim,
+            max_len=500,
             dropout=dropout_p,
         )
         
@@ -1634,7 +1734,7 @@ class MultimodalEmotionModel_Refactored(nn.Module):
             self.modality_fusion = nn.Sequential(
                 nn.Linear(hidden_dim * num_modalities_for_fusion, fusion_hidden_dim),
                 nn.GELU(),
-                nn.Dropout(dropout_p),
+                nn.Dropout(self.config.mlp_dropout),
             )
         else:
             # 原始版：ReLU激活
@@ -1664,27 +1764,34 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         if self.config.use_sphere_regularization:
             self.sphere_reg = SphereRegularization(radius=self.config.sphere_radius)
         
+        # ⭐ 课程学习：MoE Alpha 控制变量
+        # alpha=1.0 表示完全使用MoE输出，alpha=0.0 表示跳过MoE（使用原始输入）
+        self.moe_alpha = 1.0
+        
         # 10. 分类头（根据配置选择架构）
         if self.config.use_improved_mlp:
             # 改进版：4层深层MLP + GELU + 残差 + LayerNorm
+            mlp_hidden = fusion_hidden_dim * self.config.mlp_expansion_ratio
+            mlp_drop = self.config.mlp_dropout
+            
             self.pre_classifier_mlp = nn.Sequential(
-                nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
+                nn.Linear(fusion_hidden_dim, mlp_hidden),
                 nn.GELU(),
-                nn.Dropout(dropout_p),
-                nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
+                nn.Dropout(mlp_drop),
+                nn.Linear(mlp_hidden, fusion_hidden_dim),
             )
             self.pre_classifier_norm = nn.LayerNorm(fusion_hidden_dim)
             
             self.classifier = nn.Sequential(
-                nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
+                nn.Linear(fusion_hidden_dim, mlp_hidden),
                 nn.GELU(),
-                nn.Dropout(dropout_p),
-                nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim * 2),
+                nn.Dropout(mlp_drop),
+                nn.Linear(mlp_hidden, mlp_hidden),
                 nn.GELU(),
-                nn.Dropout(dropout_p * 0.7),
-                nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
+                nn.Dropout(mlp_drop * 0.5),
+                nn.Linear(mlp_hidden, fusion_hidden_dim),
                 nn.GELU(),
-                nn.Dropout(dropout_p * 0.5),
+                nn.Dropout(mlp_drop * 0.5),
                 nn.Linear(fusion_hidden_dim, num_labels),
             )
         else:
@@ -1698,6 +1805,18 @@ class MultimodalEmotionModel_Refactored(nn.Module):
                 nn.Dropout(dropout_p),
                 nn.Linear(fusion_hidden_dim, num_labels),
             )
+    
+    def set_moe_alpha(self, alpha: float) -> None:
+        """
+        设置 MoE/FiLM 模块的混合系数（用于课程学习的 alpha_blending 策略）
+        
+        Args:
+            alpha: 混合系数，范围 [0.0, 1.0]
+                   - alpha=0.0: 完全跳过 MoE，输出等于输入（恒等映射）
+                   - alpha=1.0: 完全使用 MoE 输出
+                   - 0<alpha<1: 线性插值 = (1-alpha)*input + alpha*moe_output
+        """
+        self.moe_alpha = max(0.0, min(1.0, alpha))  # 确保在 [0, 1] 范围内
     
     def forward(
         self,
@@ -1768,35 +1887,86 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         audio_seq = self.audio_proj(audio_sequence)
         video_seq = self.video_proj(video_sequence)
         
-        # ====== 阶段2.5: 位置编码 (Sinusoidal Positional Encoding) ======
-        # 为三个模态添加位置信息
-        text_seq = self.positional_encoding(text_seq)   # [B, T, H]
-        audio_seq = self.positional_encoding(audio_seq) # [B, T, H]
-        video_seq = self.positional_encoding(video_seq) # [B, T, H]
+        # ====== 阶段2.5: 文本引导的去噪门控 (Text-Guided Gating) ======
+        # 第一步：获取全局文本特征（从投影后的text_seq取均值）
+        # 如果有mask，使用mask计算正确的均值；否则简单取mean
+        if keyframe_mask is not None:
+            # 使用mask计算加权均值
+            mask_expanded = keyframe_mask.unsqueeze(-1).float()  # [B, T, 1]
+            text_global_proj = (text_seq * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-8)  # [B, H]
+        else:
+            text_global_proj = text_seq.mean(dim=1)  # [B, H]
         
-        # ====== 阶段2.6: 文本引导的软门控 (Text-Guided Gating) ======
-        # 用全局文本特征来预筛选音频和视频帧
-        # text_global 已经在前面做过归一化，直接使用
-        audio_seq, gate_audio = self.text_guided_gate_audio(text_global, audio_seq)
-        video_seq, gate_video = self.text_guided_gate_video(text_global, video_seq)
+        # 第二步：执行文本引导去噪
+        # 计算门控值
+        g_audio = self.audio_gate(text_global_proj).unsqueeze(1)  # [B, 1, H]
+        g_video = self.video_gate(text_global_proj).unsqueeze(1)  # [B, 1, H]
+        
+        # 应用门控：抑制与文本语义无关的视听噪声
+        # 原理：如果文本是"我很生气"，门控会抑制"欢快背景音"或"无关背景画面"
+        audio_seq = audio_seq * g_audio
+        video_seq = video_seq * g_video
         
         # 保存门控信息用于分析
         aux_outputs['text_guided_gates'] = {
-            'audio': gate_audio,  # [B, H]
-            'video': gate_video,  # [B, H]
+            'audio': g_audio.squeeze(1),  # [B, H]
+            'video': g_video.squeeze(1),  # [B, H]
         }
         
-        # ====== 阶段3: MoE-FiLM调制 ======
+        # ====== 阶段2.6: 位置编码 (Sinusoidal Positional Encoding) ======
+        # 在去噪之后，为三个模态添加位置信息
+        text_seq = self.pos_encoder(text_seq)   # [B, T, H]
+        audio_seq = self.pos_encoder(audio_seq) # [B, T, H]
+        video_seq = self.pos_encoder(video_seq) # [B, T, H]
+        
+        # ====== 阶段3: MoE-FiLM调制（支持课程学习的 alpha_blending）======
+        moe_aux_losses = []  # ⭐ 收集所有MoE的负载均衡损失
+        alpha = self.moe_alpha  # ⭐ 获取当前的 MoE 混合系数
+        
         if self.config.use_moe_film:
-            # 社会关系调制
-            text_seq, social_weights_text = self.social_film_text(text_seq, social_embedding)
-            audio_seq, social_weights_audio = self.social_film_audio(audio_seq, social_embedding)
-            video_seq, social_weights_video = self.social_film_video(video_seq, social_embedding)
+            # ⭐ 保存调制前的输入（用于 alpha_blending）
+            text_seq_before_moe = text_seq
+            audio_seq_before_moe = audio_seq
+            video_seq_before_moe = video_seq
             
-            # 情境调制
-            text_seq, context_weights_text = self.context_film_text(text_seq, context_embedding)
-            audio_seq, context_weights_audio = self.context_film_audio(audio_seq, context_embedding)
-            video_seq, context_weights_video = self.context_film_video(video_seq, context_embedding)
+            # 社会关系调制（3个模态 × 返回 aux_loss）
+            text_seq_moe, social_weights_text, moe_loss_s_t = self.social_film_text(text_seq, social_embedding)
+            audio_seq_moe, social_weights_audio, moe_loss_s_a = self.social_film_audio(audio_seq, social_embedding)
+            video_seq_moe, social_weights_video, moe_loss_s_v = self.social_film_video(video_seq, social_embedding)
+            moe_aux_losses.extend([moe_loss_s_t, moe_loss_s_a, moe_loss_s_v])
+            
+            # ⭐ Alpha Blending：线性插值 = (1-alpha)*input + alpha*moe_output
+            # 当 alpha=0 时，跳过 MoE（恒等映射）
+            # 当 alpha=1 时，完全使用 MoE 输出
+            if alpha < 1.0:
+                text_seq = (1 - alpha) * text_seq_before_moe + alpha * text_seq_moe
+                audio_seq = (1 - alpha) * audio_seq_before_moe + alpha * audio_seq_moe
+                video_seq = (1 - alpha) * video_seq_before_moe + alpha * video_seq_moe
+            else:
+                text_seq = text_seq_moe
+                audio_seq = audio_seq_moe
+                video_seq = video_seq_moe
+            
+            # ⭐ 保存调制后的中间结果（用于下一轮调制的 alpha_blending）
+            text_seq_before_context = text_seq
+            audio_seq_before_context = audio_seq
+            video_seq_before_context = video_seq
+            
+            # 情境调制（3个模态 × 返回 aux_loss）
+            text_seq_moe, context_weights_text, moe_loss_c_t = self.context_film_text(text_seq, context_embedding)
+            audio_seq_moe, context_weights_audio, moe_loss_c_a = self.context_film_audio(audio_seq, context_embedding)
+            video_seq_moe, context_weights_video, moe_loss_c_v = self.context_film_video(video_seq, context_embedding)
+            moe_aux_losses.extend([moe_loss_c_t, moe_loss_c_a, moe_loss_c_v])
+            
+            # ⭐ Alpha Blending for context modulation
+            if alpha < 1.0:
+                text_seq = (1 - alpha) * text_seq_before_context + alpha * text_seq_moe
+                audio_seq = (1 - alpha) * audio_seq_before_context + alpha * audio_seq_moe
+                video_seq = (1 - alpha) * video_seq_before_context + alpha * video_seq_moe
+            else:
+                text_seq = text_seq_moe
+                audio_seq = audio_seq_moe
+                video_seq = video_seq_moe
             
             aux_outputs['social_film_weights'] = {
                 'text': social_weights_text,
@@ -1808,6 +1978,13 @@ class MultimodalEmotionModel_Refactored(nn.Module):
                 'audio': context_weights_audio,
                 'video': context_weights_video,
             }
+            aux_outputs['moe_alpha'] = alpha  # ⭐ 记录当前的 alpha 值
+        
+        # ⭐ 汇总所有MoE的负载均衡损失
+        if len(moe_aux_losses) > 0:
+            aux_outputs['moe_loss'] = torch.stack(moe_aux_losses).sum()
+        else:
+            aux_outputs['moe_loss'] = torch.tensor(0.0, device=text_sequence.device)
         
         # ====== 阶段4: 时序建模 (Coupled Mamba) ======
         prior_embedding = torch.cat([social_embedding, context_embedding], dim=-1)

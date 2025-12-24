@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ========================================
-# 统一训练脚本 - 支持多数据集 + 多GPU并行
+# 统一训练脚本 - 支持多数据集 + 多GPU并行 + 训练曲线绘图
 # 使用方法:
 #   1. 【推荐】直接修改配置区域(第25行)的DATASET和GPU_ID变量，然后运行: bash train_unified.sh
 #   2. 或者使用命令行参数指定数据集: bash train_unified.sh DATASET_NAME
@@ -18,9 +18,20 @@
 #   # 修改GPU_ID=1，然后运行第二个训练（会自动创建独立目录避免冲突）
 #   bash train_unified.sh
 #   
-#   输出会自动隔离到不同目录:
-#     GPU 0: ./logs/chsims/gpu_0/, ./checkpoints/chsims/gpu_0/
-#     GPU 1: ./logs/chsims/gpu_1/, ./checkpoints/chsims/gpu_1/
+# 输出目录结构（每次训练创建独立目录）:
+#   logs/dataset/gpu_X/run_YYYYMMDD_HHMMSS/
+#     ├── train.log           # 训练日志
+#     ├── metrics.txt         # 训练配置和指标记录
+#     └── train.pid           # 进程ID文件
+#   
+#   checkpoints/dataset/gpu_X/run_YYYYMMDD_HHMMSS/
+#     ├── best_model.pth      # 最佳模型检查点
+#     ├── metrics_history.json # 指标历史（JSON格式）
+#     └── figures/            # 训练曲线图目录
+#         ├── mae_curve.png
+#         ├── acc_2_curve.png
+#         ├── loss_curve.png
+#         └── training_curves_combined.png
 # ========================================
 
 # ============================================================
@@ -28,25 +39,25 @@
 # ============================================================
 
 # --- 数据集选择 ---
-DATASET="chsimsv2"        # 数据集名称：chsims / chsimsv2 / meld
+DATASET="meld"        # 数据集名称：chsims / chsimsv2 / meld
                         # 会自动映射到对应的 _processed 子目录
 
 # --- 数据集根目录 ---
-DATA_DIR="./chsimsv2_10"           # 数据集根目录（一级目录，留空使用默认 ./data）
+DATA_DIR="./meld_10"           # 数据集根目录（一级目录，留空使用默认 ./data）
                         # 脚本会自动在此目录下查找 {dataset_name}_processed 子目录
                         # 示例：DATA_DIR="./data_new" + DATASET="meld" → ./data_new/meld_processed
 
 # --- GPU设置 ---
-GPU_ID=1                # 使用的GPU编号，多GPU用逗号分隔，如：0,1
+GPU_ID=1               # 使用的GPU编号，多GPU用逗号分隔，如：0,1
 
 # --- 基础训练参数 ---
 # 注意：不同数据集有默认值，留空("")则使用数据集默认值，填写则覆盖默认值
 BATCH_SIZE="128"          # 批大小，留空使用默认值（chsims:32, chsimsv2:32, meld:16）
-LEARNING_RATE="5e-4"        # 学习率，留空使用默认值（chsims:1e-4, chsimsv2:1e-4, meld:5e-5）
+LEARNING_RATE="1e-4"        # 学习率，留空使用默认值（chsims:1e-4, chsimsv2:1e-4, meld:5e-5）
 NUM_EPOCHS="150"         # 训练轮数，留空使用默认值（chsims:50, chsimsv2:50, meld:40）
 HIDDEN_DIM=""           # 隐藏层维度（默认：256）
-DROPOUT="0.4"              # Dropout率（默认：0.1）
-EARLY_STOP_PATIENCE="30" # 早停等待轮数（留空使用默认10，当前3，设为0禁用）⭐
+DROPOUT="0.1"              # Dropout率（默认：0.1）
+EARLY_STOP_PATIENCE="50" # 早停等待轮数（留空使用默认10，当前3，设为0禁用）⭐
 EARLY_STOP_METRIC="mae"    # 早停监控指标（留空使用默认mae，当前acc_2）⭐
                         # 可选：mae（越小越好）、acc_2（越大越好）、acc_3、f1_2、f1_3、corr、loss
 SPHERE_LOSS_WEIGHT="0.001"   # 超球体损失权重（默认：0.01，建议范围：0.001-0.1）
@@ -61,6 +72,7 @@ SCHEDULER_TYPE="cosine"       # 学习率调度器类型（默认：cosine）⭐
 SCHEDULER_GAMMA=""      # 学习率衰减系数（默认：0.5，用于step和reduce_on_plateau）
 SCHEDULER_PATIENCE=""   # 等待轮数（默认：5，仅用于reduce_on_plateau）⭐
 SCHEDULER_STEP_SIZE=""  # 步长（默认：10，仅用于step）
+WARMUP_RATIO="0.1"      # 学习率预热比例（默认0.0关闭，0.1=前10%用于预热）⭐
 
 # --- 关键帧选择（MDP3）参数 ---
 # 新的百分比模式：根据实际帧数自适应选择
@@ -72,9 +84,11 @@ FRAME_RATIO="70"         # ✓ 改进: 每段选择70%的帧（提高信息保�
 # --- MoE-FiLM 参数 ---
 NUM_FILM_EXPERTS="8"     # FiLM专家数量（默认：8）   16
 FILM_TOP_K="4"           # Top-K路由选择（默认：4）  8
+MOE_LOSS_WEIGHT="0.1"   # ⭐ MoE负载均衡损失权重（默认：0.01，防止专家坍缩）
+                         # 设为0关闭此损失
 
 # --- 超图建模（M3NET）参数 ---
-NUM_HG_LAYERS="3"        # 超图卷积层数（默认：3）
+NUM_HG_LAYERS=""        # 超图卷积层数（默认：3）
 
 # --- 频域分解（GS-MCC）参数 ---
 NUM_FOURIER_LAYERS=""   # 傅里叶层数（默认：4）
@@ -89,8 +103,8 @@ ENABLE_KEYFRAME_LOGGING=false   # 是否启用关键帧统计（true=启用，fa
 # --- 组件开关（true=关闭该组件，false或留空=使用该组件）---
 NO_KEY_FRAME_SELECTOR=true    # 关闭关键帧选择
 NO_COUPLED_MAMBA=false         # 关闭Coupled Mamba（使用独立Mamba）
-NO_MOE_FILM=true              # 关闭MoE-FiLM调制
-NO_HYPERGRAPH=true            # 关闭超图建模
+NO_MOE_FILM=false              # 关闭MoE-FiLM调制
+NO_HYPERGRAPH=false            # 关闭超图建模
 NO_FREQUENCY_DECOMP=true      # 关闭频域分解
 NO_SPHERE_REG=true            # 关闭超球体正则化
 NO_DIRECT_FUSION_PRIORS=true  # ⭐ 禁止social/context直接参与融合（只用于调制）
@@ -102,10 +116,31 @@ USE_IMPROVED_MLP=true
          # ⭐ MLP架构选择（true=改进版，false=原始版）
                                # true=改进版：4层深层MLP + GELU + 残差 + LayerNorm（容量大，性能可能更好）
                                # false=原始版：2层简单MLP + ReLU（容量小，更稳定，当前使用）
+MLP_DROPOUT=0.2              # 改进版MLP的Dropout比例（默认0.2）
+MLP_EXPANSION_RATIO=4        # 改进版MLP中间层扩维倍数（默认4，即中间层=输入×4）
+
+# --- 课程学习 (Curriculum Learning) 设置 ---
+# ⭐ 用于解决 Mamba Backbone 与 MoE 模块协同训练时的不稳定问题（特别是 Acc-5 掉点问题）
+CURRICULUM_MODE="freeze_backbone"       # 课程学习模式：
+                             #   none           = 关闭课程学习（默认行为，与之前完全兼容）
+                             #   freeze_backbone = 策略A：冻结骨干网络，只训练MoE/FiLM/Head
+                             #   alpha_blending  = 策略B：渐进式MoE混合（alpha从0.2→1.0）
+CURRICULUM_EPOCHS=5          # 课程学习持续的Epoch数（默认：5）
+                             # freeze_backbone: 前N个epoch冻结Backbone，之后解冻
+                             # alpha_blending:  alpha = min(1.0, epoch / N)
 
 # --- 后台运行设置 ---
 USE_NOHUP=true          # 使用nohup后台运行（SSH断开后继续训练）
                         # true=后台运行，false=前台运行
+
+# --- 训练曲线绘图设置 ---
+PLOT_MAE=true           # 绘制 MAE 曲线图
+PLOT_ACC2=true          # 绘制 Acc-2 (二分类准确率) 曲线图
+PLOT_ACC3=true          # 绘制 Acc-3 (三分类准确率) 曲线图
+PLOT_ACC5=true          # 绘制 Acc-5 (五分类准确率) 曲线图
+PLOT_LOSS=true          # 绘制 Loss 曲线图
+PLOT_CORR=false         # 绘制 Correlation 曲线图
+PLOT_ALL=false          # 绘制所有指标（true时忽略上面的单独开关）
 
 # --- 其他参数 ---
 # 注意：以下参数在配置文件(config_refactored.py)中设置，不通过命令行传递
@@ -320,12 +355,14 @@ fi
 [ -n "$EARLY_STOP_PATIENCE" ] && DATASET_ARGS="$DATASET_ARGS --early_stop_patience $EARLY_STOP_PATIENCE"
 [ -n "$EARLY_STOP_METRIC" ] && DATASET_ARGS="$DATASET_ARGS --early_stop_metric $EARLY_STOP_METRIC"
 [ -n "$SPHERE_LOSS_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --sphere_loss_weight $SPHERE_LOSS_WEIGHT"
+[ -n "$MOE_LOSS_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --moe_loss_weight $MOE_LOSS_WEIGHT"
 
 # 学习率调度器参数
 [ -n "$SCHEDULER_TYPE" ] && DATASET_ARGS="$DATASET_ARGS --scheduler_type $SCHEDULER_TYPE"
 [ -n "$SCHEDULER_GAMMA" ] && DATASET_ARGS="$DATASET_ARGS --scheduler_gamma $SCHEDULER_GAMMA"
 [ -n "$SCHEDULER_PATIENCE" ] && DATASET_ARGS="$DATASET_ARGS --scheduler_patience $SCHEDULER_PATIENCE"
 [ -n "$SCHEDULER_STEP_SIZE" ] && DATASET_ARGS="$DATASET_ARGS --scheduler_step_size $SCHEDULER_STEP_SIZE"
+[ -n "$WARMUP_RATIO" ] && DATASET_ARGS="$DATASET_ARGS --warmup_ratio $WARMUP_RATIO"
 [ -n "$N_SEGMENTS" ] && DATASET_ARGS="$DATASET_ARGS --n_segments $N_SEGMENTS"
 [ -n "$FRAME_RATIO" ] && DATASET_ARGS="$DATASET_ARGS --frame_ratio $FRAME_RATIO"
 [ -n "$NUM_FILM_EXPERTS" ] && DATASET_ARGS="$DATASET_ARGS --num_film_experts $NUM_FILM_EXPERTS"
@@ -353,17 +390,36 @@ fi
 [ "$NO_SPHERE_REG" = true ] && DATASET_ARGS="$DATASET_ARGS --no_sphere_reg"
 [ "$NO_DIRECT_FUSION_PRIORS" = true ] && DATASET_ARGS="$DATASET_ARGS --no_direct_fusion_priors"
 [ "$USE_IMPROVED_MLP" = true ] && DATASET_ARGS="$DATASET_ARGS --use_improved_mlp"
+[ -n "$MLP_DROPOUT" ] && DATASET_ARGS="$DATASET_ARGS --mlp_dropout $MLP_DROPOUT"
+[ -n "$MLP_EXPANSION_RATIO" ] && DATASET_ARGS="$DATASET_ARGS --mlp_expansion_ratio $MLP_EXPANSION_RATIO"
+
+# 课程学习参数
+[ -n "$CURRICULUM_MODE" ] && [ "$CURRICULUM_MODE" != "none" ] && DATASET_ARGS="$DATASET_ARGS --curriculum_mode $CURRICULUM_MODE"
+[ -n "$CURRICULUM_EPOCHS" ] && [ "$CURRICULUM_MODE" != "none" ] && DATASET_ARGS="$DATASET_ARGS --curriculum_epochs $CURRICULUM_EPOCHS"
 
 # 为多GPU并行训练创建独立目录
 # 使用GPU_ID作为目录后缀来避免冲突
 GPU_SUFFIX=$(echo $GPU_ID | tr ',' '_')  # 将逗号转为下划线，例如 "0,1" -> "0_1"
 
-# 创建必要的目录（带GPU后缀）
-mkdir -p ./logs/$DATASET/gpu_${GPU_SUFFIX}
-mkdir -p ./checkpoints/$DATASET/gpu_${GPU_SUFFIX}
+# ====== 每次训练创建独立目录 ======
+# 格式: logs/dataset/gpu_X/run_YYYYMMDD_HHMMSS/
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RUN_DIR="run_${TIMESTAMP}"
+
+# 创建本次训练的独立目录
+LOG_BASE_DIR="./logs/$DATASET/gpu_${GPU_SUFFIX}/${RUN_DIR}"
+CHECKPOINT_BASE_DIR="./checkpoints/$DATASET/gpu_${GPU_SUFFIX}/${RUN_DIR}"
+mkdir -p "$LOG_BASE_DIR"
+mkdir -p "$CHECKPOINT_BASE_DIR"
+
+echo "=========================================="
+echo "📁 本次训练输出目录:"
+echo "   日志: $LOG_BASE_DIR"
+echo "   模型: $CHECKPOINT_BASE_DIR"
+echo "=========================================="
 
 # 检查是否有相同GPU的训练正在运行（避免GPU资源冲突）
-PID_FILE="./logs/$DATASET/gpu_${GPU_SUFFIX}/train.pid"
+PID_FILE="$LOG_BASE_DIR/train.pid"
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
     if ps -p $OLD_PID > /dev/null 2>&1; then
@@ -393,7 +449,7 @@ echo "训练配置"
 echo "=========================================="
 echo "数据集: $DATASET"
 echo "GPU: $GPU_ID"
-echo "输出目录: gpu_${GPU_SUFFIX}"
+echo "运行目录: $RUN_DIR"
 echo ""
 echo "基础参数:"
 echo "  批大小: $FINAL_BATCH_SIZE"
@@ -412,22 +468,50 @@ echo "  频域分解: $([ "$NO_FREQUENCY_DECOMP" = true ] && echo '关闭' || ec
 echo "  超球体正则: $([ "$NO_SPHERE_REG" = true ] && echo '关闭' || echo '开启')"
 echo "  先验直接融合: $([ "$NO_DIRECT_FUSION_PRIORS" = true ] && echo '关闭(只调制)' || echo '开启')"
 echo ""
+echo "学习率调度:"
+echo "  调度器类型: ${SCHEDULER_TYPE:-cosine}"
+echo "  预热比例: ${WARMUP_RATIO:-0.0}"
+echo ""
 echo "MLP架构:"
 echo "  版本: $([ "$USE_IMPROVED_MLP" = true ] && echo '改进版(4层深层+GELU+残差)' || echo '原始版(2层简单+ReLU)')"
+echo "  Dropout: $MLP_DROPOUT"
+echo "  扩维倍数: $MLP_EXPANSION_RATIO"
+echo ""
+echo "课程学习 (Curriculum Learning):"
+if [ "$CURRICULUM_MODE" = "none" ] || [ -z "$CURRICULUM_MODE" ]; then
+    echo "  状态: 关闭"
+elif [ "$CURRICULUM_MODE" = "freeze_backbone" ]; then
+    echo "  状态: 开启 - 冻结骨干网络"
+    echo "  策略: 前${CURRICULUM_EPOCHS}个epoch只训练MoE/FiLM/Head，之后解冻全部参数"
+elif [ "$CURRICULUM_MODE" = "alpha_blending" ]; then
+    echo "  状态: 开启 - 渐进式Alpha混合"
+    echo "  策略: MoE影响力从0.2渐进增加到1.0（持续${CURRICULUM_EPOCHS}个epoch）"
+fi
 echo ""
 echo "分析和日志:"
 echo "  每epoch测试集评估: $([ "$EVAL_TEST_EVERY_EPOCH" = true ] && echo '开启' || echo '关闭')"
 echo "  模态贡献度分析: $([ "$ENABLE_MODALITY_ANALYSIS" = true ] && echo "开启 (每${ANALYZE_MODALITY_EVERY}个batch)" || echo '关闭')"
 echo "  关键帧统计: $([ "$ENABLE_KEYFRAME_LOGGING" = true ] && echo "开启 (每${KEYFRAME_LOG_EVERY}个utterance)" || echo '关闭')"
 echo ""
+echo "训练曲线绘图:"
+if [ "$PLOT_ALL" = true ]; then
+    echo "  绘制所有指标: 开启"
+else
+    echo "  MAE曲线: $([ "$PLOT_MAE" = true ] && echo '开启' || echo '关闭')"
+    echo "  Acc-2曲线: $([ "$PLOT_ACC2" = true ] && echo '开启' || echo '关闭')"
+    echo "  Acc-3曲线: $([ "$PLOT_ACC3" = true ] && echo '开启' || echo '关闭')"
+    echo "  Acc-5曲线: $([ "$PLOT_ACC5" = true ] && echo '开启' || echo '关闭')"
+    echo "  Loss曲线: $([ "$PLOT_LOSS" = true ] && echo '开启' || echo '关闭')"
+    echo "  Corr曲线: $([ "$PLOT_CORR" = true ] && echo '开启' || echo '关闭')"
+fi
+echo ""
 [ $# -gt 0 ] && echo "额外命令行参数: $@" && echo ""
 echo "=========================================="
 echo ""
 
-# 日志文件路径（包含GPU信息避免冲突）
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="./logs/$DATASET/gpu_${GPU_SUFFIX}/train_${TIMESTAMP}.log"
-METRICS_FILE="./logs/$DATASET/gpu_${GPU_SUFFIX}/train_${TIMESTAMP}.txt"
+# 日志文件路径（使用本次训练的独立目录）
+LOG_FILE="$LOG_BASE_DIR/train.log"
+METRICS_FILE="$LOG_BASE_DIR/metrics.txt"
 
 # 创建指标记录文件并写入配置
 echo "========================================" > "$METRICS_FILE"
@@ -435,7 +519,9 @@ echo "训练参数配置" >> "$METRICS_FILE"
 echo "========================================" >> "$METRICS_FILE"
 echo "训练时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$METRICS_FILE"
 echo "GPU设备: $GPU_ID" >> "$METRICS_FILE"
-echo "输出目录: gpu_${GPU_SUFFIX}" >> "$METRICS_FILE"
+echo "运行目录: $RUN_DIR" >> "$METRICS_FILE"
+echo "日志目录: $LOG_BASE_DIR" >> "$METRICS_FILE"
+echo "检查点目录: $CHECKPOINT_BASE_DIR" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 数据集选择 ---" >> "$METRICS_FILE"
@@ -468,6 +554,7 @@ echo "SCHEDULER_TYPE=\"$SCHEDULER_TYPE\"" >> "$METRICS_FILE"
 echo "SCHEDULER_GAMMA=\"$SCHEDULER_GAMMA\"" >> "$METRICS_FILE"
 echo "SCHEDULER_PATIENCE=\"$SCHEDULER_PATIENCE\"" >> "$METRICS_FILE"
 echo "SCHEDULER_STEP_SIZE=\"$SCHEDULER_STEP_SIZE\"" >> "$METRICS_FILE"
+echo "WARMUP_RATIO=\"$WARMUP_RATIO\"" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 关键帧选择（MDP3）参数 ---" >> "$METRICS_FILE"
@@ -478,6 +565,7 @@ echo "" >> "$METRICS_FILE"
 echo "# --- MoE-FiLM 参数 ---" >> "$METRICS_FILE"
 echo "NUM_FILM_EXPERTS=\"$NUM_FILM_EXPERTS\"" >> "$METRICS_FILE"
 echo "FILM_TOP_K=\"$FILM_TOP_K\"" >> "$METRICS_FILE"
+echo "MOE_LOSS_WEIGHT=\"$MOE_LOSS_WEIGHT\"" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 超图建模（M3NET）参数 ---" >> "$METRICS_FILE"
@@ -508,6 +596,23 @@ echo "" >> "$METRICS_FILE"
 
 echo "# --- MLP架构选择 ---" >> "$METRICS_FILE"
 echo "USE_IMPROVED_MLP=$USE_IMPROVED_MLP" >> "$METRICS_FILE"
+echo "MLP_DROPOUT=$MLP_DROPOUT" >> "$METRICS_FILE"
+echo "MLP_EXPANSION_RATIO=$MLP_EXPANSION_RATIO" >> "$METRICS_FILE"
+echo "" >> "$METRICS_FILE"
+
+echo "# --- 课程学习 (Curriculum Learning) 设置 ---" >> "$METRICS_FILE"
+echo "CURRICULUM_MODE=\"$CURRICULUM_MODE\"" >> "$METRICS_FILE"
+echo "CURRICULUM_EPOCHS=$CURRICULUM_EPOCHS" >> "$METRICS_FILE"
+echo "" >> "$METRICS_FILE"
+
+echo "# --- 训练曲线绘图设置 ---" >> "$METRICS_FILE"
+echo "PLOT_MAE=$PLOT_MAE" >> "$METRICS_FILE"
+echo "PLOT_ACC2=$PLOT_ACC2" >> "$METRICS_FILE"
+echo "PLOT_ACC3=$PLOT_ACC3" >> "$METRICS_FILE"
+echo "PLOT_ACC5=$PLOT_ACC5" >> "$METRICS_FILE"
+echo "PLOT_LOSS=$PLOT_LOSS" >> "$METRICS_FILE"
+echo "PLOT_CORR=$PLOT_CORR" >> "$METRICS_FILE"
+echo "PLOT_ALL=$PLOT_ALL" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 后台运行设置 ---" >> "$METRICS_FILE"
@@ -525,8 +630,21 @@ echo "训练指标记录" >> "$METRICS_FILE"
 echo "========================================" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
-# 训练命令（添加指标文件路径和GPU特定目录）
-TRAIN_CMD="python train_refactored.py $COMMON_ARGS $DATASET_ARGS --metrics_file $METRICS_FILE --save_dir ./checkpoints/$DATASET/gpu_${GPU_SUFFIX} --log_dir ./logs/$DATASET/gpu_${GPU_SUFFIX} $@"
+# 构建绘图参数
+PLOT_ARGS=""
+if [ "$PLOT_ALL" = true ]; then
+    PLOT_ARGS="--plot_all"
+else
+    [ "$PLOT_MAE" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_mae"
+    [ "$PLOT_ACC2" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc2"
+    [ "$PLOT_ACC3" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc3"
+    [ "$PLOT_ACC5" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc5"
+    [ "$PLOT_LOSS" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_loss"
+    [ "$PLOT_CORR" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_corr"
+fi
+
+# 训练命令（使用本次训练的独立目录）
+TRAIN_CMD="python train_refactored.py $COMMON_ARGS $DATASET_ARGS --metrics_file $METRICS_FILE --save_dir $CHECKPOINT_BASE_DIR --log_dir $LOG_BASE_DIR $PLOT_ARGS $@"
 
 # 根据配置选择运行方式
 if [ "$USE_NOHUP" = true ]; then
@@ -537,17 +655,12 @@ if [ "$USE_NOHUP" = true ]; then
     echo "日志文件: $LOG_FILE"
     echo ""
     
-    # 启动后台训练（使用当前环境）
-    # 获取当前conda环境
-    CURRENT_ENV="$CONDA_DEFAULT_ENV"
-    
-    if [ -n "$CURRENT_ENV" ] && [ "$CURRENT_ENV" != "base" ]; then
-        # 使用conda run确保在当前环境中运行
-        nohup conda run -n "$CURRENT_ENV" --no-capture-output $TRAIN_CMD > "$LOG_FILE" 2>&1 &
-    else
-        # 直接运行（假设环境已激活）
-        nohup $TRAIN_CMD > "$LOG_FILE" 2>&1 &
-    fi
+    # 启动后台训练
+    # 注意：不使用 conda run，因为：
+    # 1. 脚本开头已经验证并激活了 conda 环境
+    # 2. conda run 会 fork 子进程，导致 $! 捕获的 PID 不是实际 Python 进程的 PID
+    # 3. 直接运行可以正确捕获真正的训练进程 PID
+    nohup $TRAIN_CMD > "$LOG_FILE" 2>&1 &
     TRAIN_PID=$!
     
     # 等待一下确认启动成功
@@ -561,8 +674,13 @@ if [ "$USE_NOHUP" = true ]; then
         echo "=========================================="
         echo "GPU设备: $GPU_ID"
         echo "进程ID (PID): $TRAIN_PID"
-        echo "日志文件: $LOG_FILE"
-        echo "指标文件: $METRICS_FILE"
+        echo "运行目录: $RUN_DIR"
+        echo ""
+        echo "📁 输出文件位置:"
+        echo "   日志: $LOG_FILE"
+        echo "   指标: $METRICS_FILE"
+        echo "   模型: $CHECKPOINT_BASE_DIR/"
+        echo "   曲线图: $CHECKPOINT_BASE_DIR/figures/"
         echo ""
         echo "实用命令:"
         echo "  # 查看实时日志"
@@ -580,6 +698,9 @@ if [ "$USE_NOHUP" = true ]; then
         echo "  # 停止训练"
         echo "  kill $TRAIN_PID"
         echo ""
+        echo "  # 如果PID失效，用这个命令查找实际进程"
+        echo "  pgrep -f 'train_refactored.py.*$RUN_DIR'"
+        echo ""
         echo "  # 查看GPU使用"
         echo "  watch -n 1 nvidia-smi"
         echo ""
@@ -592,10 +713,10 @@ if [ "$USE_NOHUP" = true ]; then
         echo "      训练将在后台继续运行"
         echo "=========================================="
         
-        # 保存PID到文件（GPU特定）
-        echo $TRAIN_PID > "./logs/$DATASET/gpu_${GPU_SUFFIX}/train.pid"
+        # 保存PID到文件
+        echo $TRAIN_PID > "$PID_FILE"
         echo ""
-        echo "PID已保存到: ./logs/$DATASET/gpu_${GPU_SUFFIX}/train.pid"
+        echo "PID已保存到: $PID_FILE"
     else
         echo ""
         echo "=========================================="
@@ -622,9 +743,11 @@ else
         echo "=========================================="
         echo "训练成功完成！"
         echo "=========================================="
-        echo "结果保存位置:"
-        echo "  日志: ./logs/$DATASET/gpu_${GPU_SUFFIX}"
-        echo "  模型: ./checkpoints/$DATASET/gpu_${GPU_SUFFIX}"
+        echo "📁 结果保存位置:"
+        echo "   日志: $LOG_BASE_DIR"
+        echo "   模型: $CHECKPOINT_BASE_DIR"
+        echo "   曲线图: $CHECKPOINT_BASE_DIR/figures/"
+        echo "   指标历史: $CHECKPOINT_BASE_DIR/metrics_history.json"
         echo ""
         echo "评估模型:"
         echo "  bash eval_refactored.sh $DATASET"

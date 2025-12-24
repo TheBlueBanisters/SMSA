@@ -19,7 +19,8 @@ from utils import (
     setup_seed, setup_logger, dict_to_str,
     MetricsCalculator, EarlyStopping,
     save_checkpoint, count_parameters,
-    save_config, AverageMeter
+    save_config, AverageMeter,
+    MetricsHistory, TrainingPlotter
 )
 
 # 尝试导入模态分析器（如果存在）
@@ -90,6 +91,40 @@ class Trainer:
             elif not MODALITY_ANALYZER_AVAILABLE:
                 self.logger.info("⚠️  模态分析器未安装（modality_contribution_analyzer.py）")
         # ==========================================
+        
+        # ====== 训练曲线绘图 ======
+        self.metrics_history = MetricsHistory()
+        
+        # 绘图配置
+        self.plot_config = {
+            'mae': getattr(config, 'plot_mae', False),
+            'acc_2': getattr(config, 'plot_acc2', False),
+            'acc_3': getattr(config, 'plot_acc3', False),
+            'acc_5': getattr(config, 'plot_acc5', False),
+            'loss': getattr(config, 'plot_loss', False),
+            'corr': getattr(config, 'plot_corr', False),
+        }
+        
+        # 检查是否有任何绘图开关打开
+        self.plotting_enabled = any(self.plot_config.values())
+        
+        if self.plotting_enabled:
+            self.plotter = TrainingPlotter(config.save_dir, self.logger)
+            enabled_plots = [k for k, v in self.plot_config.items() if v]
+            self.logger.info(f"✓ 训练曲线绘图已启用: {', '.join(enabled_plots)}")
+        else:
+            self.plotter = None
+            self.logger.info("ℹ️  训练曲线绘图已禁用（可通过 --plot_mae 等开关启用）")
+        # ==========================================
+        
+        # ====== 课程学习配置 ======
+        self.curriculum_mode = getattr(config, 'curriculum_mode', 'none')
+        self.curriculum_epochs = getattr(config, 'curriculum_epochs', 5)
+        if self.curriculum_mode != 'none':
+            self.logger.info(f"✓ 课程学习已启用: mode={self.curriculum_mode}, epochs={self.curriculum_epochs}")
+        else:
+            self.logger.info("ℹ️  课程学习已禁用（可通过 --curriculum_mode 启用）")
+        # ==========================================
     
     def setup_data(self):
         """设置数据加载器"""
@@ -141,26 +176,52 @@ class Trainer:
             weight_decay=self.config.weight_decay,
         )
         
+        # 计算 warmup 步数
+        warmup_ratio = getattr(self.config, 'warmup_ratio', 0.0)
+        warmup_epochs = int(self.config.num_epochs * warmup_ratio)
+        
         if self.config.scheduler_type == 'step':
-            self.scheduler = optim.lr_scheduler.StepLR(
+            base_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer,
                 step_size=self.config.scheduler_step_size,
                 gamma=self.config.scheduler_gamma,
             )
         elif self.config.scheduler_type == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            base_scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.config.num_epochs,
+                T_max=self.config.num_epochs - warmup_epochs,  # 余弦退火阶段的总长度
             )
         elif self.config.scheduler_type == 'reduce_on_plateau':
+            # ReduceLROnPlateau 不支持 SequentialLR，单独处理
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode=self.config.metric_mode,
                 factor=self.config.scheduler_gamma,
                 patience=self.config.scheduler_patience,
             )
+            if warmup_epochs > 0:
+                self.logger.warning(f"⚠ ReduceLROnPlateau 不支持 Warmup，已忽略 warmup_ratio={warmup_ratio}")
+            return
         else:
             self.scheduler = None
+            return
+        
+        # 如果启用了 warmup，使用 SequentialLR 组合 warmup + 主调度器
+        if warmup_epochs > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.1,  # 从 10% 学习率开始
+                end_factor=1.0,    # 预热到 100% 学习率
+                total_iters=warmup_epochs,
+            )
+            self.scheduler = optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, base_scheduler],
+                milestones=[warmup_epochs],
+            )
+            self.logger.info(f"✓ 启用学习率预热: {warmup_epochs} epochs (warmup_ratio={warmup_ratio})")
+        else:
+            self.scheduler = base_scheduler
     
     def setup_criterion(self):
         """设置损失函数"""
@@ -192,6 +253,76 @@ class Trainer:
                 self.logger.info("使用标准 MSE Loss")
         else:
             self.criterion = nn.CrossEntropyLoss()
+    
+    def _apply_curriculum(self, epoch: int) -> None:
+        """
+        应用课程学习策略
+        
+        策略 A: freeze_backbone
+            - 在课程学习期间冻结 Mamba Backbone，只训练 MoE/FiLM/Head
+            - 课程结束后解冻所有参数
+        
+        策略 B: alpha_blending
+            - 渐进式增加 MoE 的影响力
+            - alpha = min(1.0, (epoch + 1) / curriculum_epochs)
+            - 所有参数始终可训练
+        
+        Args:
+            epoch: 当前 epoch 编号（从1开始）
+        """
+        if self.curriculum_mode == 'none':
+            return
+        
+        curriculum_epochs = self.curriculum_epochs
+        
+        if self.curriculum_mode == 'freeze_backbone':
+            # ====== 策略 A: 冻结骨干网络 ======
+            if epoch <= curriculum_epochs:
+                # 冻结阶段：只训练 MoE/FiLM 模块和分类头
+                frozen_count = 0
+                trainable_count = 0
+                
+                for name, param in self.model.named_parameters():
+                    # 判断是否是 MoE/FiLM/Head 相关的参数
+                    is_moe_film = any(key in name for key in [
+                        'social_film', 'context_film',  # MoE-FiLM 模块
+                        'classifier', 'pre_classifier',  # 分类头
+                        'modality_fusion',  # 融合层
+                        'freq_fusion', 'freq_decomp',  # 频域分解
+                    ])
+                    
+                    if is_moe_film:
+                        param.requires_grad = True
+                        trainable_count += 1
+                    else:
+                        param.requires_grad = False
+                        frozen_count += 1
+                
+                self.logger.info(f"📚 Curriculum: Freezing Backbone (Epoch {epoch}/{curriculum_epochs})")
+                self.logger.info(f"   Frozen params: {frozen_count}, Trainable params: {trainable_count}")
+            else:
+                # 解冻阶段：所有参数可训练
+                for param in self.model.parameters():
+                    param.requires_grad = True
+                
+                if epoch == curriculum_epochs + 1:
+                    self.logger.info(f"📚 Curriculum: Unfreezing All Parameters (Epoch {epoch})")
+                    self.logger.info(f"   All {sum(1 for _ in self.model.parameters())} parameters are now trainable")
+        
+        elif self.curriculum_mode == 'alpha_blending':
+            # ====== 策略 B: 渐进式 Alpha 混合 ======
+            # 计算当前 alpha 值：从 1/curriculum_epochs 渐进到 1.0
+            alpha = min(1.0, epoch / curriculum_epochs)
+            
+            # 调用模型的 set_moe_alpha 方法
+            if hasattr(self.model, 'set_moe_alpha'):
+                self.model.set_moe_alpha(alpha)
+            
+            self.logger.info(f"📚 Curriculum: Setting MoE Alpha to {alpha:.4f} (Epoch {epoch}/{curriculum_epochs})")
+            
+            # 确保所有参数可训练
+            for param in self.model.parameters():
+                param.requires_grad = True
     
     def log_metrics_to_file(self, epoch: int, train_metrics: Dict[str, float], 
                            valid_metrics: Dict[str, float], test_metrics: Dict[str, float] = None):
@@ -239,10 +370,14 @@ class Trainer:
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """训练一个epoch"""
+        # ⭐ 应用课程学习策略（在每个 epoch 开始时）
+        self._apply_curriculum(epoch)
+        
         self.model.train()
         
         loss_meter = AverageMeter()
         sphere_loss_meter = AverageMeter()
+        moe_loss_meter = AverageMeter()  # ⭐ MoE负载均衡损失计量器
         
         pbar = tqdm(self.train_loader,
                     desc=f'Epoch {epoch}/{self.config.num_epochs} [Train]',
@@ -352,9 +487,15 @@ class Trainer:
             else:
                 loss = self.criterion(logits, labels.long().squeeze())
             
-            # 添加超球面正则化损失
+            # 添加超球面正则化损失（可能已弃用）
             sphere_loss = aux_outputs['sphere_loss']
-            total_loss = loss + self.config.sphere_loss_weight * sphere_loss
+            
+            # ⭐ 添加MoE负载均衡损失（独立于sphere_loss）
+            moe_loss = aux_outputs.get('moe_loss', torch.tensor(0.0, device=loss.device))
+            moe_loss_weight = getattr(self.config, 'moe_loss_weight', 0.0)
+            
+            # 计算总损失
+            total_loss = loss + self.config.sphere_loss_weight * sphere_loss + moe_loss_weight * moe_loss
             
             # 反向传播
             total_loss.backward()
@@ -368,15 +509,16 @@ class Trainer:
             # 更新统计
             loss_meter.update(loss.item(), text_seq.size(0))
             sphere_loss_meter.update(sphere_loss.item(), text_seq.size(0))
+            moe_loss_meter.update(moe_loss.item(), text_seq.size(0))  # ⭐ 更新MoE损失
             
             # 收集预测和标签
             all_preds.append(logits.detach().cpu())
             all_labels.append(labels.detach().cpu())
             
-            # 更新进度条
+            # 更新进度条（包含MoE损失）
             pbar.set_postfix({
                 'loss': f'{loss_meter.avg:.4f}',
-                'sph_loss': f'{sphere_loss_meter.avg:.4f}',
+                'moe': f'{moe_loss_meter.avg:.4f}',  # ⭐ 显示MoE损失
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
             })
         
@@ -401,6 +543,7 @@ class Trainer:
         
         metrics['loss'] = loss_meter.avg
         metrics['sphere_loss'] = sphere_loss_meter.avg
+        metrics['moe_loss'] = moe_loss_meter.avg  # ⭐ 记录MoE负载均衡损失
         
         return metrics
     
@@ -505,6 +648,12 @@ class Trainer:
             # 记录指标到txt文件
             self.log_metrics_to_file(epoch, train_metrics, valid_metrics, test_metrics_epoch)
             
+            # 记录指标到历史（用于绘图）
+            self.metrics_history.update('train', epoch, train_metrics)
+            self.metrics_history.update('valid', epoch, valid_metrics)
+            if test_metrics_epoch is not None:
+                self.metrics_history.update('test', epoch, test_metrics_epoch)
+            
             # 学习率调度
             if self.scheduler is not None:
                 if self.config.scheduler_type == 'reduce_on_plateau':
@@ -599,6 +748,37 @@ class Trainer:
         
         self.logger.info(f"\nTraining completed! Best epoch: {self.best_epoch}")
         self.logger.info(f"Best validation metric: {self.best_metric:.4f}")
+        
+        # ====== 训练结束后绘制曲线图 ======
+        if self.plotting_enabled and self.plotter is not None:
+            self.logger.info("\n" + "="*60)
+            self.logger.info("生成训练曲线图...")
+            self.logger.info("="*60)
+            
+            # 判断是否包含测试集数据
+            include_test = getattr(self.config, 'eval_test_every_epoch', False)
+            
+            # 绘制各个指标的独立图
+            saved_paths = self.plotter.plot_all_metrics(
+                self.metrics_history, 
+                self.plot_config,
+                include_test=include_test
+            )
+            
+            # 绘制组合图
+            combined_path = self.plotter.plot_combined_figure(
+                self.metrics_history,
+                self.plot_config,
+                include_test=include_test
+            )
+            
+            # 保存指标历史到JSON
+            history_path = os.path.join(self.config.save_dir, 'metrics_history.json')
+            self.metrics_history.save_to_json(history_path)
+            self.logger.info(f"✓ 已保存指标历史: {history_path}")
+            
+            self.logger.info("="*60 + "\n")
+        # ==========================================
 
 
 def main():
@@ -621,6 +801,16 @@ def main():
                         help='早停监控指标（composite为综合指标：0.4*MAE + 0.3*Corr + 0.3*Acc5）')
     parser.add_argument('--sphere_loss_weight', type=float, default=None,
                         help='超球体损失权重（可选，默认0.01）')
+    parser.add_argument('--moe_loss_weight', type=float, default=None,
+                        help='MoE负载均衡损失权重（可选，默认0.01，防止专家坍缩）')
+    
+    # ⭐ 课程学习参数
+    parser.add_argument('--curriculum_mode', type=str, default=None,
+                        choices=['none', 'freeze_backbone', 'alpha_blending'],
+                        help='课程学习模式：none=关闭，freeze_backbone=冻结骨干网络，alpha_blending=渐进式MoE混合')
+    parser.add_argument('--curriculum_epochs', type=int, default=None,
+                        help='课程学习持续的Epoch数（默认：5）')
+    
     parser.add_argument('--hidden_dim', type=int, default=None,
                         help='隐藏层维度（可选，默认256）')
     parser.add_argument('--dropout_p', type=float, default=None,
@@ -636,6 +826,8 @@ def main():
                         help='等待轮数（默认5，仅用于reduce_on_plateau）')
     parser.add_argument('--scheduler_step_size', type=int, default=None,
                         help='步长（默认10，仅用于step）')
+    parser.add_argument('--warmup_ratio', type=float, default=None,
+                        help='学习率预热比例（默认0.0关闭，0.1=前10%步数用于预热）')
     
     # 组件参数
     parser.add_argument('--n_key_frames', type=int, default=None,
@@ -687,6 +879,10 @@ def main():
                         help='禁止social/context直接参与融合（只用于FiLM调制）')
     parser.add_argument('--use_improved_mlp', action='store_true',
                         help='使用改进版MLP（4层深层+GELU+残差+LayerNorm）')
+    parser.add_argument('--mlp_dropout', type=float, default=0.2,
+                        help='改进版MLP的Dropout比例（默认0.2）')
+    parser.add_argument('--mlp_expansion_ratio', type=int, default=4,
+                        help='改进版MLP中间层扩维倍数（默认4）')
     
     # 指标记录文件
     parser.add_argument('--metrics_file', type=str, default=None,
@@ -697,6 +893,22 @@ def main():
                         help='模型保存目录（用于多GPU并行训练避免冲突）')
     parser.add_argument('--log_dir', type=str, default=None,
                         help='日志目录（用于多GPU并行训练避免冲突）')
+    
+    # ====== 训练曲线绘图开关 ======
+    parser.add_argument('--plot_mae', action='store_true',
+                        help='绘制 MAE 曲线图')
+    parser.add_argument('--plot_acc2', action='store_true',
+                        help='绘制 Acc-2 (二分类准确率) 曲线图')
+    parser.add_argument('--plot_acc3', action='store_true',
+                        help='绘制 Acc-3 (三分类准确率) 曲线图')
+    parser.add_argument('--plot_acc5', action='store_true',
+                        help='绘制 Acc-5 (五分类准确率) 曲线图')
+    parser.add_argument('--plot_loss', action='store_true',
+                        help='绘制 Loss 曲线图')
+    parser.add_argument('--plot_corr', action='store_true',
+                        help='绘制 Correlation 曲线图')
+    parser.add_argument('--plot_all', action='store_true',
+                        help='绘制所有指标曲线图（等同于启用所有 --plot_* 开关）')
     
     args = parser.parse_args()
     
@@ -718,6 +930,15 @@ def main():
         config.early_stop_metric = args.early_stop_metric
     if args.sphere_loss_weight is not None:
         config.sphere_loss_weight = args.sphere_loss_weight
+    if args.moe_loss_weight is not None:
+        config.moe_loss_weight = args.moe_loss_weight
+    
+    # ⭐ 课程学习参数覆盖
+    if args.curriculum_mode is not None:
+        config.curriculum_mode = args.curriculum_mode
+    if args.curriculum_epochs is not None:
+        config.curriculum_epochs = args.curriculum_epochs
+    
     if args.hidden_dim is not None:
         config.hidden_dim = args.hidden_dim
     if args.dropout_p is not None:
@@ -732,6 +953,8 @@ def main():
         config.scheduler_patience = args.scheduler_patience
     if args.scheduler_step_size is not None:
         config.scheduler_step_size = args.scheduler_step_size
+    if args.warmup_ratio is not None:
+        config.warmup_ratio = args.warmup_ratio
     
     # 模态和关键帧分析参数
     if args.enable_modality_analysis:
@@ -785,6 +1008,10 @@ def main():
         config.model_config.direct_fusion_priors = False
     if args.use_improved_mlp:
         config.model_config.use_improved_mlp = True
+    if args.mlp_dropout is not None:
+        config.model_config.mlp_dropout = args.mlp_dropout
+    if args.mlp_expansion_ratio is not None:
+        config.model_config.mlp_expansion_ratio = args.mlp_expansion_ratio
     
     # 指标记录文件
     if args.metrics_file is not None:
@@ -795,6 +1022,24 @@ def main():
         config.save_dir = args.save_dir
     if args.log_dir is not None:
         config.log_dir = args.log_dir
+    
+    # ====== 绘图开关 ======
+    if args.plot_all:
+        # --plot_all 启用所有绘图
+        config.plot_mae = True
+        config.plot_acc2 = True
+        config.plot_acc3 = True
+        config.plot_acc5 = True
+        config.plot_loss = True
+        config.plot_corr = True
+    else:
+        # 单独的绘图开关
+        config.plot_mae = args.plot_mae
+        config.plot_acc2 = args.plot_acc2
+        config.plot_acc3 = args.plot_acc3
+        config.plot_acc5 = args.plot_acc5
+        config.plot_loss = args.plot_loss
+        config.plot_corr = args.plot_corr
     
     # 训练
     trainer = Trainer(config)
