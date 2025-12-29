@@ -44,9 +44,12 @@ import sys
 import pickle
 import argparse
 import traceback
+import re
+import threading
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -299,7 +302,6 @@ def merge_videos_for_mllm(video_paths: List[str], output_path: str, max_duration
 def call_mllm(video_path: str, prompt: str, client: OpenAI, model_name: str, desc: str = "MLLM", temperature: float = 0.7) -> str:
     """调用 MLLM 分析视频"""
     import time
-    import re
     
     # 编码视频
     video_base64 = encode_video_to_base64(video_path)
@@ -338,6 +340,142 @@ def call_mllm(video_path: str, prompt: str, client: OpenAI, model_name: str, des
     except Exception as e:
         print(f"    ⚠️  MLLM 调用失败: {e}")
         return ""
+
+
+# ========== 并行 MLLM 调用 ==========
+
+class ParallelMLLMProcessor:
+    """并行MLLM处理器 - 支持多线程并发调用API"""
+    
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model_name: str,
+        text_model,
+        num_workers: int = 4,
+        temperature: float = 0.7,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model_name = model_name
+        self.text_model = text_model
+        self.num_workers = num_workers
+        self.temperature = temperature
+        self.lock = threading.Lock()
+        self._local = threading.local()
+    
+    def _get_client(self) -> OpenAI:
+        """获取线程本地的OpenAI客户端"""
+        if not hasattr(self._local, 'client'):
+            self._local.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return self._local.client
+    
+    def call_mllm_single(self, video_path: str, prompt: str, desc: str = "MLLM") -> str:
+        """单个MLLM调用"""
+        try:
+            client = self._get_client()
+            video_base64 = encode_video_to_base64(video_path)
+            
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"data:video/mp4;base64,{video_base64}",
+                                "mime_type": "video/mp4"
+                            }
+                        }
+                    ]
+                }
+            ]
+            
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=self.temperature
+            )
+            result = response.choices[0].message.content.strip()
+            
+            # 提取 <answer></answer> 标签中的内容
+            match = re.search(r'<answer>(.*?)</answer>', result, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+            return result
+        
+        except Exception as e:
+            return ""
+    
+    def process_utterance(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """处理单个utterance的MLLM任务"""
+        result = {
+            'video_id': task['video_id'],
+            'utterance_id': task['utterance_id'],
+            'social_text': '',
+            'context_text': '',
+            'social_emb': None,
+            'context_emb': None,
+        }
+        
+        video_path = task['video_path']
+        if not Path(video_path).exists():
+            return result
+        
+        D_s = self.text_model.get_sentence_embedding_dimension()
+        
+        try:
+            # 社会关系
+            if task.get('extract_social', True):
+                social_text = self.call_mllm_single(video_path, task['social_prompt'], "社会关系")
+                result['social_text'] = social_text
+                if social_text:
+                    social_emb = self.text_model.encode(social_text, convert_to_numpy=True, normalize_embeddings=True)
+                    result['social_emb'] = social_emb.astype(np.float32)
+                else:
+                    result['social_emb'] = np.zeros(D_s, dtype=np.float32)
+            
+            # 情境
+            if task.get('extract_context', True):
+                context_text = self.call_mllm_single(video_path, task['context_prompt'], "情境分析")
+                result['context_text'] = context_text
+                if context_text:
+                    context_emb = self.text_model.encode(context_text, convert_to_numpy=True, normalize_embeddings=True)
+                    result['context_emb'] = context_emb.astype(np.float32)
+                else:
+                    result['context_emb'] = np.zeros(D_s, dtype=np.float32)
+        
+        except Exception as e:
+            if result['social_emb'] is None:
+                result['social_emb'] = np.zeros(D_s, dtype=np.float32)
+            if result['context_emb'] is None:
+                result['context_emb'] = np.zeros(D_s, dtype=np.float32)
+        
+        return result
+    
+    def process_batch(self, tasks: List[Dict[str, Any]], desc: str = "MLLM批处理") -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """并行处理一批任务，返回 {(video_id, utterance_id): result}"""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = {
+                executor.submit(self.process_utterance, task): (task['video_id'], task['utterance_id'])
+                for task in tasks
+            }
+            
+            with tqdm(total=len(futures), desc=desc, leave=False) as pbar:
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        result = future.result()
+                        results[key] = result
+                    except Exception as e:
+                        pass
+                    pbar.update(1)
+        
+        return results
 
 
 # ========== 数据集加载器 ==========
@@ -384,6 +522,9 @@ class CHSIMSLoader(DatasetLoader):
             'clip_id': 'utterance_id',
             'text': 'text',
             'label': 'label',
+            'label_T': 'label_T',
+            'label_A': 'label_A',
+            'label_V': 'label_V',
             'mode': 'split',
         })
         # clip_id 可能被解析为整数，确保保持原始的零填充格式
@@ -649,11 +790,11 @@ def update_prior_only(
     dataset_loader: DatasetLoader,
     output_dir: Path,
     text_model,
-    mllm_client,
+    mllm_processor: Optional[ParallelMLLMProcessor],
     args,
 ) -> bool:
     """
-    只更新先验特征（社会关系和/或情境）
+    只更新先验特征（社会关系和/或情境）- 支持并行处理
     读取已有的 utterances.pkl，为每个 utterance 单独提取先验特征
     
     Returns:
@@ -679,67 +820,63 @@ def update_prior_only(
         
         D_s = text_model.get_sentence_embedding_dimension()
         
-        # 为每个 utterance 单独提取先验特征
+        # 收集 MLLM 任务
         utterance_ids = video_data.get('utterance_ids', [])
-        success_count = 0
+        mllm_tasks = []
         
-        pbar = tqdm(utterance_ids, desc=f"  更新先验特征", leave=False)
-        for utt_id in pbar:
-            pbar.set_postfix({'utt_id': utt_id})
-            
+        for utt_id in utterance_ids:
             # 获取视频路径
             video_path = dataset_loader.get_video_path(video_id, utt_id, mode)
             if not video_path.exists():
-                print(f"    ⚠️  未找到 {utt_id} 的视频文件")
                 continue
             
-            # 确保 utterance 数据存在
-            if utt_id not in video_data['utterances']:
-                video_data['utterances'][utt_id] = {}
-            
-            utt_data = video_data['utterances'][utt_id]
-            
-            try:
-                # 提取社会关系
-                if extract_social:
-                    social_text = call_mllm(str(video_path), args.social_prompt, mllm_client, args.model_name, desc="社会关系", temperature=args.temperature)
-                    if social_text:
-                        social_emb = text_model.encode(social_text, convert_to_numpy=True, normalize_embeddings=True)
-                        utt_data['social'] = social_emb.astype(np.float32)
-                        utt_data['social_text'] = social_text
-                    else:
-                        utt_data['social'] = np.zeros(D_s, dtype=np.float32)
-                        utt_data['social_text'] = ''
-                
-                # 提取情境
-                if extract_context:
-                    context_text = call_mllm(str(video_path), args.context_prompt, mllm_client, args.model_name, desc="情境分析", temperature=args.temperature)
-                    if context_text:
-                        context_emb = text_model.encode(context_text, convert_to_numpy=True, normalize_embeddings=True)
-                        utt_data['context'] = context_emb.astype(np.float32)
-                        utt_data['context_text'] = context_text
-                    else:
-                        utt_data['context'] = np.zeros(D_s, dtype=np.float32)
-                        utt_data['context_text'] = ''
-                
-                success_count += 1
-                
-            except Exception as e:
-                print(f"    ⚠️  处理 {utt_id} 失败: {e}")
-                # 设置默认值
-                if extract_social:
-                    utt_data['social'] = np.zeros(D_s, dtype=np.float32)
-                    utt_data['social_text'] = ''
-                if extract_context:
-                    utt_data['context'] = np.zeros(D_s, dtype=np.float32)
-                    utt_data['context_text'] = ''
+            mllm_tasks.append({
+                'video_id': video_id,
+                'utterance_id': utt_id,
+                'video_path': str(video_path),
+                'social_prompt': args.social_prompt,
+                'context_prompt': args.context_prompt,
+                'extract_social': extract_social,
+                'extract_context': extract_context,
+            })
         
-        # 保存更新后的数据
-        with open(video_pkl, 'wb') as f:
-            pickle.dump(video_data, f)
+        if not mllm_tasks:
+            print(f"  ⚠️  {video_id}: 没有找到有效的视频文件")
+            return False
         
-        print(f"  ✅ 成功更新 {success_count}/{len(utterance_ids)} 个 utterance 的先验特征")
-        return success_count > 0
+        # 并行调用 MLLM
+        if mllm_processor:
+            print(f"  并行MLLM调用 ({len(mllm_tasks)} 任务, {mllm_processor.num_workers} 并行)")
+            mllm_results = mllm_processor.process_batch(mllm_tasks, desc=f"  更新先验特征")
+            
+            success_count = 0
+            for (vid, utt_id), result in mllm_results.items():
+                # 确保 utterance 数据存在
+                if utt_id not in video_data['utterances']:
+                    video_data['utterances'][utt_id] = {}
+                
+                utt_data = video_data['utterances'][utt_id]
+                
+                if extract_social:
+                    utt_data['social'] = result.get('social_emb', np.zeros(D_s, dtype=np.float32))
+                    utt_data['social_text'] = result.get('social_text', '')
+                
+                if extract_context:
+                    utt_data['context'] = result.get('context_emb', np.zeros(D_s, dtype=np.float32))
+                    utt_data['context_text'] = result.get('context_text', '')
+                
+                if result.get('social_text') or result.get('context_text'):
+                    success_count += 1
+            
+            # 保存更新后的数据
+            with open(video_pkl, 'wb') as f:
+                pickle.dump(video_data, f)
+            
+            print(f"  ✅ 成功更新 {success_count}/{len(utterance_ids)} 个 utterance 的先验特征")
+            return success_count > 0
+        else:
+            print(f"  ⚠️  MLLM处理器未初始化，跳过")
+            return False
     
     except Exception as e:
         print(f"  ❌ {video_id}: 更新失败 - {e}")
@@ -755,11 +892,11 @@ def process_video(
     wavlm,
     wavlm_feat,
     text_model,
-    mllm_client,
+    mllm_processor: Optional[ParallelMLLMProcessor],
     args,
 ) -> Dict:
     """
-    处理单个视频的所有语句
+    处理单个视频的所有语句（支持并行MLLM调用）
     
     Returns:
         {
@@ -793,16 +930,22 @@ def process_video(
     
     D_s = text_model.get_sentence_embedding_dimension()
     
-    # ========== 为每个语句提取所有特征（包括先验特征） ==========
+    # ========== 第一阶段：提取基本模态特征 ==========
     pbar_utterances = tqdm(utterances_df.iterrows(), total=len(utterances_df), 
                            desc=f"  处理语句", leave=False)
     
     skipped_files = []  # 记录跳过的文件
+    mllm_tasks = []  # 收集 MLLM 任务
     
     for idx, row in pbar_utterances:
         utterance_id = row['utterance_id']
         text_content = row['text']
         label = float(row['label'])
+        
+        # 尝试获取单模态标签（如果存在）
+        label_T = float(row.get('label_T', 0.0))
+        label_A = float(row.get('label_A', 0.0))
+        label_V = float(row.get('label_V', 0.0))
         
         pbar_utterances.set_postfix({'utt_id': utterance_id})
         
@@ -816,7 +959,12 @@ def process_video(
             continue
         
         try:
-            utterance_data = {'label': label}
+            utterance_data = {
+                'label': label,
+                'label_T': label_T,
+                'label_A': label_A,
+                'label_V': label_V
+            }
             
             # ===== 提取基本模态（视觉、音频、文本）=====
             if extract_basic:
@@ -842,37 +990,26 @@ def process_video(
                 utterance_data['audio'] = utterance_audio
                 utterance_data['text'] = text_emb
             
-            # ===== 提取先验模态（社会关系、情境）=====
-            if extract_prior and mllm_client and not args.skip_mllm:
-                # 社会关系
-                if extract_social:
-                    social_text = call_mllm(str(utterance_file), args.social_prompt, mllm_client, args.model_name, desc="社会关系", temperature=args.temperature)
-                    if social_text:
-                        social_emb = text_model.encode(social_text, convert_to_numpy=True, normalize_embeddings=True)
-                        utterance_data['social'] = social_emb.astype(np.float32)
-                        utterance_data['social_text'] = social_text
-                    else:
-                        utterance_data['social'] = np.zeros(D_s, dtype=np.float32)
-                        utterance_data['social_text'] = ''
-                
-                # 情境
-                if extract_context:
-                    context_text = call_mllm(str(utterance_file), args.context_prompt, mllm_client, args.model_name, desc="情境分析", temperature=args.temperature)
-                    if context_text:
-                        context_emb = text_model.encode(context_text, convert_to_numpy=True, normalize_embeddings=True)
-                        utterance_data['context'] = context_emb.astype(np.float32)
-                        utterance_data['context_text'] = context_text
-                    else:
-                        utterance_data['context'] = np.zeros(D_s, dtype=np.float32)
-                        utterance_data['context_text'] = ''
-            elif extract_prior:
-                # 跳过 MLLM 时使用零向量
+            # 初始化先验特征（零向量），稍后并行填充
+            if extract_prior:
                 if extract_social:
                     utterance_data['social'] = np.zeros(D_s, dtype=np.float32)
                     utterance_data['social_text'] = ''
                 if extract_context:
                     utterance_data['context'] = np.zeros(D_s, dtype=np.float32)
                     utterance_data['context_text'] = ''
+                
+                # 收集 MLLM 任务
+                if mllm_processor and not args.skip_mllm:
+                    mllm_tasks.append({
+                        'video_id': video_id,
+                        'utterance_id': utterance_id,
+                        'video_path': str(utterance_file),
+                        'social_prompt': args.social_prompt,
+                        'context_prompt': args.context_prompt,
+                        'extract_social': extract_social,
+                        'extract_context': extract_context,
+                    })
             
             video_data['utterance_ids'].append(utterance_id)
             video_data['utterances'][utterance_id] = utterance_data
@@ -880,6 +1017,21 @@ def process_video(
         except Exception as e:
             print(f"  ⚠️  处理语句 {utterance_id} 失败: {e}")
             continue
+    
+    # ========== 第二阶段：并行调用 MLLM ==========
+    if mllm_tasks and mllm_processor:
+        print(f"  并行MLLM调用 ({len(mllm_tasks)} 任务, {mllm_processor.num_workers} 并行)")
+        mllm_results = mllm_processor.process_batch(mllm_tasks, desc="  MLLM处理")
+        
+        # 将结果填充到 utterance 数据中
+        for (vid, utt_id), result in mllm_results.items():
+            if utt_id in video_data['utterances']:
+                if result.get('social_emb') is not None:
+                    video_data['utterances'][utt_id]['social'] = result['social_emb']
+                    video_data['utterances'][utt_id]['social_text'] = result['social_text']
+                if result.get('context_emb') is not None:
+                    video_data['utterances'][utt_id]['context'] = result['context_emb']
+                    video_data['utterances'][utt_id]['context_text'] = result['context_text']
     
     if len(video_data['utterances']) == 0:
         print(f"  ❌ 没有成功处理任何语句 (CSV中有{len(utterances_df)}条记录，但所有视频文件都不存在)")
@@ -949,6 +1101,10 @@ def main():
     parser.add_argument('--max_merge_duration', type=float, default=60.0,
                         help='合并视频的最大时长（秒），超过则只取部分utterance')
     
+    # 并行参数
+    parser.add_argument('--parallel_workers', type=int, default=4,
+                        help='MLLM并行调用数量（可根据API限制调整）')
+    
     # 提示词
     parser.add_argument('--social_prompt', type=str, default=DEFAULT_SOCIAL_PROMPT,
                         help='社会关系提示词')
@@ -966,6 +1122,7 @@ def main():
     print("\n" + "="*60)
     print(f"加载数据集: {args.dataset}")
     print(f"提取模式: {args.extract_mode}")
+    print(f"MLLM并行数: {args.parallel_workers}")
     print("="*60)
     
     mode_desc = {
@@ -1047,19 +1204,27 @@ def main():
         text_model = None
         print("[3/4] 跳过文本模型")
     
-    # MLLM 客户端
-    print("[4/4] 初始化 MLLM 客户端...")
+    # MLLM 并行处理器
+    print("[4/4] 初始化 MLLM 并行处理器...")
+    mllm_processor = None
     if need_mllm:
         try:
-            mllm_client = OpenAI(api_key=args.api_key, base_url=args.base_url)
-            print(f"  ✅ MLLM 客户端初始化成功")
+            mllm_processor = ParallelMLLMProcessor(
+                api_key=args.api_key,
+                base_url=args.base_url,
+                model_name=args.model_name,
+                text_model=text_model,
+                num_workers=args.parallel_workers,
+                temperature=args.temperature,
+            )
+            print(f"  ✅ MLLM 并行处理器初始化成功 (并行数: {args.parallel_workers})")
         except Exception as e:
-            print(f"  ⚠️  MLLM 客户端初始化失败: {e}")
+            print(f"  ⚠️  MLLM 处理器初始化失败: {e}")
             print("  ⚠️  将跳过 MLLM 特征提取")
             args.skip_mllm = True
-            mllm_client = None
+            mllm_processor = None
     else:
-        mllm_client = None
+        mllm_processor = None
         print("  ⏭️  跳过 MLLM")
     
     # ========== 处理视频 ==========
@@ -1098,7 +1263,7 @@ def main():
                     dataset_loader=dataset_loader,
                     output_dir=output_dir,
                     text_model=text_model,
-                    mllm_client=mllm_client,
+                    mllm_processor=mllm_processor,
                     args=args,
                 )
                 if success:
@@ -1116,7 +1281,7 @@ def main():
                     wavlm=wavlm,
                     wavlm_feat=wavlm_feat,
                     text_model=text_model,
-                    mllm_client=mllm_client,
+                    mllm_processor=mllm_processor,
                     args=args,
                 )
                 

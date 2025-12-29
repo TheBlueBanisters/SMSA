@@ -171,13 +171,23 @@ class ModelConfig:
         num_film_experts=8,
         film_top_k=4,
         
+        # ⭐ DSPS（条件化SSM）- 与MoE-FiLM互斥
+        use_dsps=False,            # True=启用DSPS条件化SSM，False=关闭
+                                   # ⚠️ 重要：use_dsps=True 时必须 use_moe_film=False
+        dsps_strength=0.1,         # DSPS强度因子（0.0=无效果，1.0=完全效果，默认0.1）
+        
         # 超图建模 (M3NET)
         use_hypergraph=True,
         num_hypergraph_layers=3,
+        hypergraph_use_residue=True,  # 拼接残差（M3NET原始方式）
+        max_dialogue_len=50,       # 对话级batching的最大utterance数
         
-        # 频域分解 (GS-MCC)
+        # 频域分解 (GS-MCC / FGN)
         use_frequency_decomp=True,
         num_fourier_layers=4,
+        fgn_use_residue=True,           # FGN拼接残差（GS-MCC原始方式）
+        fourier_sparsity_threshold=0.01,  # 傅里叶稀疏阈值
+        fourier_hidden_size_factor=1,     # 傅里叶隐藏层倍数
         
         # 超球体正则
         use_sphere_regularization=True,
@@ -190,6 +200,11 @@ class ModelConfig:
         use_improved_mlp=False,  # True=改进版（4层深层），False=原始版（2层简单）
         mlp_dropout=0.2,         # 改进版MLP的Dropout比例
         mlp_expansion_ratio=4,   # 改进版MLP中间层扩维倍数
+        
+        # ⭐ KL散度多任务学习 (GS-MCC)
+        use_kl_mtl=False,        # True=启用KL散度多任务学习
+        kl_mtl_weight=1.0,       # KL散度损失的权重
+        unimodal_loss_weight=1.0,  # 单模态分类损失的权重
     ):
         self.use_key_frame_selector = use_key_frame_selector
         self.n_segments = n_segments
@@ -206,11 +221,19 @@ class ModelConfig:
         self.num_film_experts = num_film_experts
         self.film_top_k = film_top_k
         
+        self.use_dsps = use_dsps
+        self.dsps_strength = dsps_strength
+        
         self.use_hypergraph = use_hypergraph
         self.num_hypergraph_layers = num_hypergraph_layers
+        self.hypergraph_use_residue = hypergraph_use_residue
+        self.max_dialogue_len = max_dialogue_len
         
         self.use_frequency_decomp = use_frequency_decomp
         self.num_fourier_layers = num_fourier_layers
+        self.fgn_use_residue = fgn_use_residue
+        self.fourier_sparsity_threshold = fourier_sparsity_threshold
+        self.fourier_hidden_size_factor = fourier_hidden_size_factor
         
         self.use_sphere_regularization = use_sphere_regularization
         self.sphere_radius = sphere_radius
@@ -219,6 +242,11 @@ class ModelConfig:
         self.use_improved_mlp = use_improved_mlp
         self.mlp_dropout = mlp_dropout
         self.mlp_expansion_ratio = mlp_expansion_ratio
+        
+        # KL散度多任务学习
+        self.use_kl_mtl = use_kl_mtl
+        self.kl_mtl_weight = kl_mtl_weight
+        self.unimodal_loss_weight = unimodal_loss_weight
 
 
 # ==================== 1. 关键帧选择模块 (参考MDP3) ====================
@@ -873,7 +901,11 @@ class MoE_FiLM_Modulation(nn.Module):
 # ==================== 3. Mamba相关模块 ====================
 
 class MambaBlock(nn.Module):
-    """Mamba块（用于非耦合情况）"""
+    """Mamba块（用于非耦合情况）
+    
+    ⭐ DSPS 支持：当 use_dsps=True 时，forward 接受 dsps_cond 参数，
+       并将其传递给内部的 Mamba 进行条件化 SSM 参数生成
+    """
     def __init__(
         self,
         hidden_dim: int,
@@ -881,23 +913,34 @@ class MambaBlock(nn.Module):
         d_state: int = 64,
         d_conv: int = 4,
         expand: int = 2,
+        # ⭐ DSPS 参数
+        use_dsps: bool = False,
+        dsps_cond_dim: Optional[int] = None,
+        dsps_strength: float = 0.1,  # DSPS 强度因子
     ):
         super().__init__()
+        self.use_dsps = use_dsps
         self.mamba = Mamba(
             d_model=hidden_dim,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
+            use_dsps=use_dsps,
+            dsps_cond_dim=dsps_cond_dim,
+            dsps_strength=dsps_strength,
         )
         self.dropout = nn.Dropout(dropout_p)
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                dsps_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x: [B, T, D] 输入序列
             mask: [B, T] 1=有效帧，0=padding帧
+            dsps_cond: [B, cond_dim] DSPS条件输入（可选）
         """
-        x = self.mamba(x)
+        # ⭐ 传递 dsps_cond 给 Mamba
+        x = self.mamba(x, dsps_cond=dsps_cond)
         x = self.dropout(x)
         
         # ⭐ 严格应用mask：将padding位置的输出清零
@@ -921,6 +964,9 @@ class CoupledMambaBlock(nn.Module):
        x_A_new = x_A + α * context_A (α由先验门控控制)
     2. Mamba时序建模：各模态通过自己的Mamba
     3. 残差连接：output = mamba_out + x_original
+    
+    ⭐ DSPS 支持：当 use_dsps=True 时，将 prior_embedding 作为条件传递给 Mamba，
+       在 dt/B/C 生成路径中注入条件信息
     """
     def __init__(
         self,
@@ -931,11 +977,17 @@ class CoupledMambaBlock(nn.Module):
         d_state: int = 64,
         d_conv: int = 4,
         expand: int = 2,
+        # ⭐ DSPS 参数
+        use_dsps: bool = False,
+        dsps_strength: float = 0.1,
     ):
         super().__init__()
         self.modality_names = modality_names
         self.hidden_dim = hidden_dim
         self.num_modalities = len(modality_names)
+        self.use_dsps = use_dsps
+        self.dsps_strength = dsps_strength
+        self.prior_dim = prior_dim
         
         # ====== Pre-Mamba 跨模态融合模块 ======
         # 轻量级投影：将其他模态的拼接特征投影到目标维度
@@ -958,12 +1010,16 @@ class CoupledMambaBlock(nn.Module):
         
         # ====== Mamba 时序建模 ======
         # 每个模态独立的Mamba块
+        # ⭐ 如果启用 DSPS，则将 prior_dim 作为条件维度传递给 Mamba
         self.modality_mambas = nn.ModuleDict({
             name: Mamba(
                 d_model=hidden_dim,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
+                use_dsps=use_dsps,
+                dsps_cond_dim=prior_dim if use_dsps else None,
+                dsps_strength=dsps_strength,
             ) for name in modality_names
         })
         
@@ -1031,7 +1087,11 @@ class CoupledMambaBlock(nn.Module):
         mamba_outputs = {}
         for name in self.modality_names:
             x_fused = fused_inputs[name]
-            mamba_out = self.modality_mambas[name](x_fused)
+            # ⭐ DSPS：如果启用，将 prior_embedding 作为条件传递给 Mamba
+            if self.use_dsps:
+                mamba_out = self.modality_mambas[name](x_fused, dsps_cond=prior_embedding)
+            else:
+                mamba_out = self.modality_mambas[name](x_fused)
             
             # 应用mask
             if mask is not None:
@@ -1069,6 +1129,9 @@ class CoupledMambaStack(nn.Module):
     - 残差连接 + LayerNorm
     
     Stack只需要简单地堆叠多层即可。
+    
+    ⭐ DSPS 支持：当 use_dsps=True 时，prior_embedding 会被传递给每层的 Mamba，
+       用于条件化 SSM 参数生成
     """
     def __init__(
         self,
@@ -1077,10 +1140,15 @@ class CoupledMambaStack(nn.Module):
         prior_dim: int,
         num_layers: int,
         dropout_p: float = 0.1,
+        # ⭐ DSPS 参数
+        use_dsps: bool = False,
+        dsps_strength: float = 0.1,
     ):
         super().__init__()
         self.modality_names = modality_names
         self.num_layers = num_layers
+        self.use_dsps = use_dsps
+        self.dsps_strength = dsps_strength
         
         # 堆叠多层CoupledMambaBlock
         self.layers = nn.ModuleList([
@@ -1089,6 +1157,8 @@ class CoupledMambaStack(nn.Module):
                 hidden_dim=hidden_dim,
                 prior_dim=prior_dim,
                 dropout_p=dropout_p,
+                use_dsps=use_dsps,  # ⭐ 传递 DSPS 参数
+                dsps_strength=dsps_strength,
             )
             for _ in range(num_layers)
         ])
@@ -1255,8 +1325,20 @@ class HypergraphConv(MessagePassing):
         if hyperedge_index.numel() > 0:
             num_edges = int(hyperedge_index[1].max()) + 1
         
+        # 验证索引范围
+        if hyperedge_index.numel() > 0:
+            max_node_idx = int(hyperedge_index[0].max())
+            if max_node_idx >= num_nodes:
+                raise ValueError(
+                    f"HypergraphConv: max node index ({max_node_idx}) >= num_nodes ({num_nodes}). "
+                    f"Check hyperedge_index construction."
+                )
+        
         if hyperedge_weight is None:
             hyperedge_weight = x.new_ones(num_edges)
+        
+        # 线性变换节点特征
+        x = torch.matmul(x, self.weight)  # [N, out_channels] or [N, heads * out_channels]
         
         # 计算度数
         D = scatter_add(
@@ -1277,52 +1359,84 @@ class HypergraphConv(MessagePassing):
         B = 1.0 / B
         B[B == float("inf")] = 0
         
-        # 两阶段传播
-        self.flow = 'source_to_target'
-        out = self.propagate(hyperedge_index, x=x, norm=B, size=(num_nodes, num_edges))
+        # 阶段1: 节点 -> 超边 (聚合每条超边连接的所有节点)
+        # 使用自定义聚合而不是 propagate，避免 flow 问题
+        edge_features = scatter_add(
+            x[hyperedge_index[0]] * B[hyperedge_index[1]].unsqueeze(-1),
+            hyperedge_index[1],
+            dim=0,
+            dim_size=num_edges
+        )  # [num_edges, out_dim]
         
-        self.flow = 'target_to_source'
-        out = self.propagate(hyperedge_index, x=out, norm=D, size=(num_edges, num_nodes))
-        
-        if self.concat is True and out.size(1) == 1:
-            out = out.view(-1, self.heads * self.out_channels)
-        else:
-            out = out.mean(dim=1)
+        # 阶段2: 超边 -> 节点 (聚合每个节点连接的所有超边)
+        out = scatter_add(
+            edge_features[hyperedge_index[1]] * D[hyperedge_index[0]].unsqueeze(-1),
+            hyperedge_index[0],
+            dim=0,
+            dim_size=num_nodes
+        )  # [num_nodes, out_dim]
         
         if self.bias is not None:
             out = out + self.bias
         
         return F.leaky_relu(out)
-    
-    def message(self, x_j, norm_i):
-        H, F = self.heads, self.out_channels
-        if x_j.dim() == 2:
-            out = norm_i.view(-1, 1, 1) * x_j.view(-1, H, F)
-        else:
-            out = norm_i.view(-1, 1, 1) * x_j
-        return out
 
 
 class HypergraphModule(nn.Module):
     """
-    超图建模模块 (参考M3NET)
-    构建两种超边并进行超图卷积
+    超图建模模块 - 严格按照 M3NET 原始实现
+    
+    M3NET 原始设计:
+    1. 节点排列: 按对话分组，每个对话内按 [L, A, V] 顺序
+    2. 上下文超边: 每个对话只有 3 条（每个模态1条），连接该模态所有 utterance
+    3. 跨模态超边: 每个 utterance 1条，连接 3 个模态
+    4. 可学习超边权重和属性
+    5. 拼接残差（而非加法残差）
     """
     def __init__(
         self,
         hidden_dim: int,
         num_layers: int = 3,
         dropout: float = 0.1,
+        use_residue: bool = True,
+        max_num_edges: int = 2000,  # 超边权重参数的最大数量
+        max_num_connections: int = 10000,  # 边-节点连接权重的最大数量
+        # 以下参数保留兼容性但不使用
+        context_window: int = 0,
+        use_gate: bool = False,
+        aggregation: str = 'last',
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.use_residue = use_residue
+        self.num_modalities = 3  # text, audio, video
         
-        # 超图卷积层
+        # ⭐ 超边索引缓存（避免每个 batch 重复构建）
+        # 缓存键: tuple(batch_dia_len)
+        # 缓存值: (node_idx_list, hyperedge_idx_list, hyperedge_type_list)
+        self._hyperedge_cache = {}
+        self._cache_max_size = 1000  # 限制缓存大小
+        
+        # 输入投影层（M3NET: self.fc1）
+        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # 超图卷积层（M3NET: self.hyperconv1, hyperconv2, ...）
         self.hyperconv_layers = nn.ModuleList([
             HypergraphConv(hidden_dim, hidden_dim)
             for _ in range(num_layers)
         ])
+        
+        # 可学习的超边权重（M3NET: self.hyperedge_weight）
+        self.hyperedge_weight = nn.Parameter(torch.ones(max_num_edges))
+        
+        # 可学习的边-节点权重（M3NET: self.EW_weight）
+        self.ew_weight = nn.Parameter(torch.ones(max_num_connections))
+        
+        # 可学习的超边属性（M3NET: self.hyperedge_attr1, hyperedge_attr2）
+        # attr1 用于跨模态超边，attr2 用于上下文超边
+        self.hyperedge_attr_cross = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.hyperedge_attr_context = nn.Parameter(torch.randn(hidden_dim) * 0.02)
         
         self.dropout = nn.Dropout(dropout)
         self.act_fn = nn.ReLU()
@@ -1335,199 +1449,359 @@ class HypergraphModule(nn.Module):
         """
         Args:
             utterance_features: 语句级特征 {text: [B,D], audio: [B,D], video: [B,D]}
-            batch_dia_len: 每个对话中的utterance数量 (例如 [5, 3, 7] 表示batch中3个对话)
+            batch_dia_len: 每个对话中的utterance数量
         Returns:
-            updated_features: 更新后的特征
+            updated_features: 更新后的特征 {text: [B,D'], audio: [B,D'], video: [B,D']}
         """
         modality_names = list(utterance_features.keys())
-        num_modalities = len(modality_names)
         
-        # 构建超图索引
-        hyperedge_index, node_features = self._build_hypergraph(
+        # 构建超图（按 M3NET 方式）
+        hyperedge_index, node_features, hyperedge_type = self._build_hypergraph_m3net(
             utterance_features, batch_dia_len, modality_names
         )
         
-        # 超图卷积
-        x = node_features
-        for layer in self.hyperconv_layers:
-            x = layer(x, hyperedge_index)
-            x = self.dropout(x)
+        # 保存原始特征用于残差
+        features_original = node_features
         
-        # 分解回各模态
-        updated_features = self._split_features(x, batch_dia_len, modality_names)
+        # 输入投影
+        x = self.input_proj(node_features)
+        
+        # 获取超边权重（截取实际使用的数量）
+        num_edges = int(hyperedge_index[1].max().item()) + 1 if hyperedge_index.numel() > 0 else 0
+        weight = self.hyperedge_weight[:num_edges]
+        
+        # 计算超边属性（根据超边类型选择）
+        # hyperedge_type: 1 表示跨模态超边，0 表示上下文超边
+        edge_attr = (self.hyperedge_attr_cross.unsqueeze(0) * hyperedge_type.unsqueeze(1) + 
+                     self.hyperedge_attr_context.unsqueeze(0) * (1 - hyperedge_type.unsqueeze(1)))
+        
+        # 多层超图卷积
+        out = x
+        for layer in self.hyperconv_layers:
+            out = layer(out, hyperedge_index, weight)
+        
+        # 拼接残差（M3NET 方式）
+        if self.use_residue:
+            out = torch.cat([features_original, out], dim=-1)  # [N, 2*D]
+        
+        # 逆转特征回各模态
+        updated_features = self._reverse_features(out, batch_dia_len, modality_names)
         
         return updated_features
     
-    def _build_hypergraph(
+    def _build_hypergraph_m3net(
         self,
         utterance_features: Dict[str, torch.Tensor],
         batch_dia_len: List[int],
         modality_names: List[str],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        构建超图结构
-        返回:
-            hyperedge_index: [2, E] 超边索引
-            node_features: [N, D] 节点特征 (所有模态拼接)
+        按 M3NET 原始方式构建超图（带缓存优化）
+        
+        节点排列方式（按对话分组）：
+        对话1: [L1, L2, ..., Ln, A1, A2, ..., An, V1, V2, ..., Vn]
+        对话2: [L1, L2, ..., Lm, A1, A2, ..., Am, V1, V2, ..., Vm]
+        ...
+        
+        超边类型：
+        1. 上下文超边：每个对话 3 条（每个模态1条），连接该模态所有 utterance
+        2. 跨模态超边：每个 utterance 1条，连接 3 个模态
+        
+        ⭐ 缓存优化：相同的 batch_dia_len 组合会产生相同的超边索引，
+           只需要重新构建节点特征，避免重复的 Python 循环开销。
         """
         device = utterance_features[modality_names[0]].device
         num_modalities = len(modality_names)
         
-        # 拼接所有模态特征为节点
-        node_features_list = []
-        for name in modality_names:
-            node_features_list.append(utterance_features[name])
-        node_features = torch.cat(node_features_list, dim=0)  # [B*M, D]
+        # ⭐ 缓存键：使用 batch_dia_len 的元组
+        cache_key = tuple(batch_dia_len)
         
-        # 构建超边
+        # ⭐ 检查缓存
+        if cache_key in self._hyperedge_cache:
+            # 缓存命中：直接使用缓存的索引
+            cached_node_idx, cached_edge_idx, cached_type = self._hyperedge_cache[cache_key]
+            
+            # 只需要重新构建节点特征（这部分必须每次做）
+            features_list = []
+            offset = 0
+            for dia_len in batch_dia_len:
+                for m_idx, name in enumerate(modality_names):
+                    modal_feat = utterance_features[name][offset:offset + dia_len]
+                    features_list.append(modal_feat)
+                offset += dia_len
+            
+            node_features = torch.cat(features_list, dim=0)
+            
+            # 将缓存的索引转换为张量（在正确的设备上）
+            hyperedge_index = torch.tensor(
+                [cached_node_idx, cached_edge_idx],
+                dtype=torch.long,
+                device=device
+            )
+            hyperedge_type = torch.tensor(cached_type, dtype=torch.float, device=device)
+            
+            return hyperedge_index, node_features, hyperedge_type
+        
+        # ⭐ 缓存未命中：构建超边索引
         node_idx_list = []
         hyperedge_idx_list = []
+        hyperedge_type_list = []  # 1=跨模态, 0=上下文
+        
+        node_count = 0
         edge_count = 0
-        node_offset = 0
+        features_list = []
         
+        # 遍历每个对话
+        offset = 0
         for dia_len in batch_dia_len:
-            # 为这个对话构建超边
+            # 计算该对话的节点索引
+            nodes = list(range(dia_len * num_modalities))
+            nodes = [j + node_count for j in nodes]
             
-            # 1. 上下文超边：每个模态连接该对话的所有utterance
+            # 分割各模态节点
+            nodes_per_modality = []
             for m_idx in range(num_modalities):
-                nodes_in_edge = [node_offset + m_idx * dia_len + i for i in range(dia_len)]
-                for node in nodes_in_edge:
-                    node_idx_list.append(node)
-                    hyperedge_idx_list.append(edge_count)
-                edge_count += 1
+                start = m_idx * dia_len
+                end = (m_idx + 1) * dia_len
+                nodes_per_modality.append(nodes[start:end])
             
-            # 2. 跨模态超边：每个utterance连接所有模态
+            # === 1. 上下文超边：每个模态一条，连接该模态所有 utterance ===
+            for m_idx in range(num_modalities):
+                modality_nodes = nodes_per_modality[m_idx]
+                if len(modality_nodes) > 1:  # 至少2个节点才创建超边
+                    for node in modality_nodes:
+                        node_idx_list.append(node)
+                        hyperedge_idx_list.append(edge_count)
+                    hyperedge_type_list.append(0)  # 上下文超边
+                    edge_count += 1
+            
+            # === 2. 跨模态超边：每个 utterance 一条，连接 3 个模态 ===
             for utt_idx in range(dia_len):
-                nodes_in_edge = [
-                    node_offset + m_idx * dia_len + utt_idx
-                    for m_idx in range(num_modalities)
-                ]
-                for node in nodes_in_edge:
+                cross_modal_nodes = [nodes_per_modality[m][utt_idx] for m in range(num_modalities)]
+                for node in cross_modal_nodes:
                     node_idx_list.append(node)
                     hyperedge_idx_list.append(edge_count)
+                hyperedge_type_list.append(1)  # 跨模态超边
                 edge_count += 1
             
-            node_offset += dia_len * num_modalities
+            # === 构建该对话的节点特征（按 [L, A, V] 顺序）===
+            for m_idx, name in enumerate(modality_names):
+                modal_feat = utterance_features[name][offset:offset + dia_len]
+                features_list.append(modal_feat)
+            
+            node_count += dia_len * num_modalities
+            offset += dia_len
         
-        hyperedge_index = torch.tensor(
-            [node_idx_list, hyperedge_idx_list],
-            dtype=torch.long,
-            device=device
-        )
+        # ⭐ 存入缓存（限制缓存大小）
+        if len(self._hyperedge_cache) < self._cache_max_size:
+            self._hyperedge_cache[cache_key] = (
+                node_idx_list.copy(),
+                hyperedge_idx_list.copy(),
+                hyperedge_type_list.copy()
+            )
         
-        return hyperedge_index, node_features
+        # 构建超边索引张量
+        if len(node_idx_list) > 0:
+            hyperedge_index = torch.tensor(
+                [node_idx_list, hyperedge_idx_list],
+                dtype=torch.long,
+                device=device
+            )
+        else:
+            hyperedge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+        
+        # 拼接所有节点特征
+        node_features = torch.cat(features_list, dim=0)
+        
+        # 超边类型张量
+        hyperedge_type = torch.tensor(hyperedge_type_list, dtype=torch.float, device=device)
+        
+        return hyperedge_index, node_features, hyperedge_type
     
-    def _split_features(
+    def _reverse_features(
         self,
         node_features: torch.Tensor,
         batch_dia_len: List[int],
         modality_names: List[str],
     ) -> Dict[str, torch.Tensor]:
-        """将节点特征分解回各模态"""
+        """
+        将超图输出的节点特征逆转回各模态
+        
+        M3NET 原始实现会将 [对话1_L, 对话1_A, 对话1_V, 对话2_L, ...]
+        转换为 {text: [all_L], audio: [all_A], video: [all_V]}
+        并在维度上拼接
+        """
         num_modalities = len(modality_names)
-        total_utterances = sum(batch_dia_len)
+        feature_dim = node_features.size(-1)
         
-        # node_features: [total_utterances * num_modalities, D]
-        # 按模态分组
-        features_per_modality = torch.chunk(node_features, num_modalities, dim=0)
+        # 分离各模态
+        modality_features = {name: [] for name in modality_names}
         
+        offset = 0
+        for dia_len in batch_dia_len:
+            for m_idx, name in enumerate(modality_names):
+                start = offset + m_idx * dia_len
+                end = offset + (m_idx + 1) * dia_len
+                modality_features[name].append(node_features[start:end])
+            offset += dia_len * num_modalities
+        
+        # 拼接各模态
         updated_features = {}
-        for i, name in enumerate(modality_names):
-            updated_features[name] = features_per_modality[i]  # [total_utterances, D]
+        for name in modality_names:
+            updated_features[name] = torch.cat(modality_features[name], dim=0)
         
         return updated_features
 
 
-# ==================== 6. 傅里叶图分解模块 (参考GS-MCC) ====================
+# ==================== 6. 傅里叶图网络模块 (严格按照 GS-MCC FGN) ====================
 
-class FourierGraphDecomposition(nn.Module):
+class FourierGraphNetwork(nn.Module):
     """
-    傅里叶图分解模块 (参考GS-MCC)
-    将特征分解为高频和低频分支
+    傅里叶图网络 (FGN) - 严格按照 GS-MCC 原始实现
+    
+    用于在节点序列上捕获频域特征，与超图模块并行使用。
+    
+    GS-MCC 原始设计：
+    1. 输入是节点序列 [B, N, D]
+    2. 在序列维度(dim=1)做 FFT
+    3. 3层复数卷积（带层间残差）
+    4. IFFT 还原
+    5. 输出与原始特征拼接
     """
     def __init__(
         self,
         embed_size: int,
         hidden_size: int,
-        num_layers: int = 4,
         sparsity_threshold: float = 0.01,
         hidden_size_factor: int = 1,
+        use_residue: bool = True,
     ):
         super().__init__()
         self.embed_size = embed_size
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
         self.sparsity_threshold = sparsity_threshold
         self.hidden_size_factor = hidden_size_factor
+        self.use_residue = use_residue
         self.scale = 0.02
         
-        # 傅里叶卷积权重
-        # rfft会将D维变为D//2+1维
-        self.frequency_size = embed_size // 2 + 1
-        self.w_layers = nn.ParameterList([
-            nn.Parameter(
+        # Token embedding（GS-MCC: self.embeddings）
+        self.token_embedding = nn.Parameter(torch.randn(1, embed_size))
+        
+        # 频率空间大小（rfft 后的维度）
+        self.frequency_size = embed_size
+        
+        # 3层复数卷积权重（GS-MCC: self.w1, w2, w3, b1, b2, b3）
+        # 注意：GS-MCC 使用对角矩阵式乘法 'bli,ii->bli'
+        self.w1 = nn.Parameter(
                 self.scale * torch.randn(2, self.frequency_size, self.frequency_size * hidden_size_factor)
             )
-            for _ in range(num_layers)
-        ])
-        self.b_layers = nn.ParameterList([
-            nn.Parameter(self.scale * torch.randn(2, self.frequency_size * hidden_size_factor))
-            for _ in range(num_layers)
-        ])
+        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size * hidden_size_factor))
+        
+        self.w2 = nn.Parameter(
+            self.scale * torch.randn(2, self.frequency_size * hidden_size_factor, self.frequency_size)
+        )
+        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size))
+        
+        self.w3 = nn.Parameter(
+            self.scale * torch.randn(2, self.frequency_size, self.frequency_size * hidden_size_factor)
+        )
+        self.b3 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size * hidden_size_factor))
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, D] 输入特征
+            x: [N, D] 节点序列特征（所有对话的所有utterance拼接）
         Returns:
-            low_freq: [B, D] 低频分量
-            high_freq: [B, D] 高频分量
+            out: [N, D] 或 [N, 2*D] (如果 use_residue)
         """
-        B, D = x.shape
+        N, D = x.shape
         
-        # FFT
-        x_fft = torch.fft.rfft(x, dim=-1, norm='ortho')  # [B, D//2+1]
+        # Token embedding: [N, D] -> [N, D]
+        # GS-MCC: x = x.unsqueeze(2) * self.embeddings -> [B, N, D]
+        # 我们简化为直接使用 x
         
-        # 傅里叶图卷积
-        x_complex = torch.stack([x_fft.real, x_fft.imag], dim=-1)  # [B, D//2+1, 2]
+        # FFT 在节点维度上（捕获对话中utterance的周期性模式）
+        # [N, D] -> [N//2+1, D]
+        x_fft = torch.fft.rfft(x, dim=0, norm='ortho')
+        freq_len = x_fft.shape[0]
         
-        for i in range(self.num_layers):
-            x_real = x_complex[..., 0]
-            x_imag = x_complex[..., 1]
+        # 保存用于残差
+        bias = x_fft
+        
+        # 3层 Fourier Graph Convolution
+        x_real = x_fft.real  # [freq_len, D]
+        x_imag = x_fft.imag
             
-            # 复数乘法
-            o_real = F.relu(
-                torch.einsum('bd,dd->bd', x_real, self.w_layers[i][0]) -
-                torch.einsum('bd,dd->bd', x_imag, self.w_layers[i][1]) +
-                self.b_layers[i][0]
+        # Layer 1
+        o1_real = F.relu(
+            torch.matmul(x_real, self.w1[0]) -
+            torch.matmul(x_imag, self.w1[1]) +
+            self.b1[0]
             )
-            o_imag = F.relu(
-                torch.einsum('bd,dd->bd', x_imag, self.w_layers[i][0]) +
-                torch.einsum('bd,dd->bd', x_real, self.w_layers[i][1]) +
-                self.b_layers[i][1]
+        o1_imag = F.relu(
+            torch.matmul(x_imag, self.w1[0]) +
+            torch.matmul(x_real, self.w1[1]) +
+            self.b1[1]
+        )
+        y = torch.stack([o1_real, o1_imag], dim=-1)
+        y = F.softshrink(y, lambd=self.sparsity_threshold)
+        
+        # Layer 2
+        o2_real = F.relu(
+            torch.matmul(y[..., 0], self.w2[0]) -
+            torch.matmul(y[..., 1], self.w2[1]) +
+            self.b2[0]
+        )
+        o2_imag = F.relu(
+            torch.matmul(y[..., 1], self.w2[0]) +
+            torch.matmul(y[..., 0], self.w2[1]) +
+            self.b2[1]
             )
-            
-            x_complex = torch.stack([o_real, o_imag], dim=-1)
-            x_complex = F.softshrink(x_complex, lambd=self.sparsity_threshold)
+        x_layer2 = torch.stack([o2_real, o2_imag], dim=-1)
+        x_layer2 = F.softshrink(x_layer2, lambd=self.sparsity_threshold)
+        # 层间残差
+        x_layer2 = x_layer2 + y[..., :x_layer2.shape[-2], :]  # 维度对齐
         
-        # 分离高低频
-        freq_mag = torch.sqrt(x_complex[..., 0]**2 + x_complex[..., 1]**2)
-        threshold = freq_mag.median(dim=-1, keepdim=True)[0]
+        # Layer 3
+        o3_real = F.relu(
+            torch.matmul(x_layer2[..., 0], self.w3[0]) -
+            torch.matmul(x_layer2[..., 1], self.w3[1]) +
+            self.b3[0]
+        )
+        o3_imag = F.relu(
+            torch.matmul(x_layer2[..., 1], self.w3[0]) +
+            torch.matmul(x_layer2[..., 0], self.w3[1]) +
+            self.b3[1]
+        )
+        z = torch.stack([o3_real, o3_imag], dim=-1)
+        z = F.softshrink(z, lambd=self.sparsity_threshold)
         
-        low_mask = (freq_mag <= threshold).float().unsqueeze(-1)
-        high_mask = (freq_mag > threshold).float().unsqueeze(-1)
+        # ⭐ 修复：Layer3 输出 z [freq_len, D*factor, 2]，需要投影回 D 维度
+        # 以便与 bias [freq_len, D] 相加并进行 IFFT
+        # 方案：截取前 D 个维度（对应原始特征空间）
+        z_proj = z[..., :D, :]  # [freq_len, D, 2]
         
-        low_freq_complex = x_complex * low_mask
-        high_freq_complex = x_complex * high_mask
+        # 层间残差：与 Layer2 输出相加
+        z_proj = z_proj + x_layer2  # 两者都是 [freq_len, D, 2]
+        
+        # 转回复数
+        z_complex = torch.complex(z_proj[..., 0], z_proj[..., 1])  # [freq_len, D]
+        
+        # 频域残差（与原始 FFT 输出相加）
+        z_complex = z_complex + bias  # 两者都是 [freq_len, D]
         
         # IFFT
-        low_freq_fft = torch.complex(low_freq_complex[..., 0], low_freq_complex[..., 1])
-        high_freq_fft = torch.complex(high_freq_complex[..., 0], high_freq_complex[..., 1])
+        out = torch.fft.irfft(z_complex, n=N, dim=0, norm='ortho')  # [N, D]
         
-        low_freq = torch.fft.irfft(low_freq_fft, n=D, dim=-1, norm='ortho')
-        high_freq = torch.fft.irfft(high_freq_fft, n=D, dim=-1, norm='ortho')
+        # 拼接残差
+        if self.use_residue:
+            out = torch.cat([x, out], dim=-1)  # [N, 2*D]
         
-        return low_freq, high_freq
+        return out
+
+
+# 保留旧类名的别名，向后兼容
+FourierGraphDecomposition = FourierGraphNetwork
 
 
 # ==================== 7. 超球体正则化 ====================
@@ -1677,6 +1951,9 @@ class MultimodalEmotionModel_Refactored(nn.Module):
             )
         
         # 4. 时序建模 (Mamba / Coupled Mamba)
+        # ⭐ DSPS 条件维度 = social_dim + context_dim
+        dsps_cond_dim = social_dim + context_dim
+        
         if self.config.use_coupled_mamba:
             # Coupled Mamba (使用拼接的social+context作为prior)
             self.coupled_stack = CoupledMambaStack(
@@ -1685,17 +1962,35 @@ class MultimodalEmotionModel_Refactored(nn.Module):
                 prior_dim=social_dim + context_dim,
                 num_layers=num_coupled_layers,
                 dropout_p=dropout_p,
+                use_dsps=self.config.use_dsps,  # ⭐ 传递 DSPS 参数
+                dsps_strength=self.config.dsps_strength,
             )
         else:
             # 独立Mamba
+            # ⭐ 如果启用 DSPS，传递条件维度
             self.text_mamba = nn.ModuleList([
-                MambaBlock(hidden_dim, dropout_p) for _ in range(num_ism_layers)
+                MambaBlock(
+                    hidden_dim, dropout_p,
+                    use_dsps=self.config.use_dsps,
+                    dsps_cond_dim=dsps_cond_dim if self.config.use_dsps else None,
+                    dsps_strength=self.config.dsps_strength,
+                ) for _ in range(num_ism_layers)
             ])
             self.audio_mamba = nn.ModuleList([
-                MambaBlock(hidden_dim, dropout_p) for _ in range(num_ism_layers)
+                MambaBlock(
+                    hidden_dim, dropout_p,
+                    use_dsps=self.config.use_dsps,
+                    dsps_cond_dim=dsps_cond_dim if self.config.use_dsps else None,
+                    dsps_strength=self.config.dsps_strength,
+                ) for _ in range(num_ism_layers)
             ])
             self.video_mamba = nn.ModuleList([
-                MambaBlock(hidden_dim, dropout_p) for _ in range(num_ism_layers)
+                MambaBlock(
+                    hidden_dim, dropout_p,
+                    use_dsps=self.config.use_dsps,
+                    dsps_cond_dim=dsps_cond_dim if self.config.use_dsps else None,
+                    dsps_strength=self.config.dsps_strength,
+                ) for _ in range(num_ism_layers)
             ])
         
         # 5. 注意力池化 (帧 → 语句)
@@ -1708,13 +2003,52 @@ class MultimodalEmotionModel_Refactored(nn.Module):
             ) for name in self.modality_names
         })
         
-        # 6. 超图建模 (M3NET)
+        # 6. 超图建模 (M3NET) + FGN (GS-MCC) 并行分支
+        # 支持两个独立开关：use_hypergraph 和 use_frequency_decomp
+        
+        # 计算分支输出维度
+        hypergraph_use_residue = getattr(self.config, 'hypergraph_use_residue', True)
+        fgn_use_residue = getattr(self.config, 'fgn_use_residue', True)
+        
+        # 分支A：超图卷积
         if self.config.use_hypergraph:
             self.hypergraph = HypergraphModule(
                 hidden_dim=hidden_dim,
-                num_layers=self.config.num_hypergraph_layers,
+                num_layers=getattr(self.config, 'num_hypergraph_layers', 3),
                 dropout=dropout_p,
+                use_residue=hypergraph_use_residue,
             )
+            self.hypergraph_out_dim = hidden_dim * 2 if hypergraph_use_residue else hidden_dim
+        
+        # 分支B：FGN 频域网络（与超图并行）
+        if self.config.use_frequency_decomp:
+            fgn_sparsity = getattr(self.config, 'fourier_sparsity_threshold', 0.01)
+            fgn_hidden_factor = getattr(self.config, 'fourier_hidden_size_factor', 1)
+            self.fgn = FourierGraphNetwork(
+                embed_size=hidden_dim,
+                hidden_size=hidden_dim,
+                sparsity_threshold=fgn_sparsity,
+                hidden_size_factor=fgn_hidden_factor,
+                use_residue=fgn_use_residue,
+            )
+            self.fgn_out_dim = hidden_dim * 2 if fgn_use_residue else hidden_dim
+        
+        # 分支合并投影层
+        # 根据开关组合计算输入维度
+        branch_out_dim = 0
+        if self.config.use_hypergraph:
+            branch_out_dim += self.hypergraph_out_dim
+        if self.config.use_frequency_decomp:
+            branch_out_dim += self.fgn_out_dim
+        
+        if branch_out_dim > 0:
+            # 投影回 hidden_dim（每个模态一个投影层）
+            self.branch_proj = nn.ModuleDict({
+                name: nn.Linear(branch_out_dim, hidden_dim)
+                for name in self.modality_names
+            })
+        else:
+            self.branch_proj = None
         
         # 7. 分类头
         if fusion_hidden_dim is None:
@@ -1744,21 +2078,8 @@ class MultimodalEmotionModel_Refactored(nn.Module):
                 nn.Dropout(dropout_p),
             )
         
-        # 8. 频域分解 (GS-MCC) - 在融合之后
-        if self.config.use_frequency_decomp:
-            self.freq_decomp = FourierGraphDecomposition(
-                embed_size=fusion_hidden_dim,  # 使用融合后的维度
-                hidden_size=fusion_hidden_dim,
-                num_layers=self.config.num_fourier_layers,
-            )
-            # 频域融合（根据MLP类型选择激活函数）
-            if self.config.use_improved_mlp:
-                self.freq_fusion = nn.Sequential(
-                    nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
-                    nn.GELU(),
-                )
-            else:
-                self.freq_fusion = nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim)
+        # 8. 频域分解已移到阶段6与超图并行
+        # (保留注释说明架构变化)
         
         # 9. 超球体正则化
         if self.config.use_sphere_regularization:
@@ -1767,6 +2088,25 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         # ⭐ 课程学习：MoE Alpha 控制变量
         # alpha=1.0 表示完全使用MoE输出，alpha=0.0 表示跳过MoE（使用原始输入）
         self.moe_alpha = 1.0
+        
+        # ⭐ KL散度多任务学习：单模态分类头 (GS-MCC)
+        if self.config.use_kl_mtl:
+            # 每个模态独立的分类头
+            self.text_classifier = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout_p),
+                nn.Linear(hidden_dim, num_labels),
+            )
+            self.audio_classifier = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout_p),
+                nn.Linear(hidden_dim, num_labels),
+            )
+            self.video_classifier = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout_p),
+                nn.Linear(hidden_dim, num_labels),
+            )
         
         # 10. 分类头（根据配置选择架构）
         if self.config.use_improved_mlp:
@@ -2008,12 +2348,14 @@ class MultimodalEmotionModel_Refactored(nn.Module):
             video_seq = coupled_sequences["video"]
         else:
             # 独立Mamba
+            # ⭐ DSPS：如果启用，将 prior_embedding 作为条件传递给 Mamba
+            dsps_cond = prior_embedding if self.config.use_dsps else None
             for mamba_layer in self.text_mamba:
-                text_seq = mamba_layer(text_seq, effective_mask)  # ⭐ 使用mask
+                text_seq = mamba_layer(text_seq, effective_mask, dsps_cond=dsps_cond)  # ⭐ 使用mask + DSPS
             for mamba_layer in self.audio_mamba:
-                audio_seq = mamba_layer(audio_seq, effective_mask)  # ⭐ 使用mask
+                audio_seq = mamba_layer(audio_seq, effective_mask, dsps_cond=dsps_cond)  # ⭐ 使用mask + DSPS
             for mamba_layer in self.video_mamba:
-                video_seq = mamba_layer(video_seq, effective_mask)  # ⭐ 使用mask
+                video_seq = mamba_layer(video_seq, effective_mask, dsps_cond=dsps_cond)  # ⭐ 使用mask + DSPS
         
         # ====== 阶段5: 注意力池化 (帧 → 语句) ======
         cond_for_pool = torch.cat([text_global, social_embedding, context_embedding], dim=-1)
@@ -2023,17 +2365,59 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         audio_utt = self.attn_pooling["audio"](audio_seq, cond_for_pool, effective_mask)
         video_utt = self.attn_pooling["video"](video_seq, cond_for_pool, effective_mask)
         
-        # ====== 阶段6: 超图建模 (M3NET) ======
-        if self.config.use_hypergraph and batch_dia_len is not None:
+        # ====== 阶段6: 超图 + FGN 并行分支 ======
+        # 支持两个独立开关：use_hypergraph 和 use_frequency_decomp
+        
+        use_hg = self.config.use_hypergraph and batch_dia_len is not None
+        use_fgn = self.config.use_frequency_decomp and batch_dia_len is not None
+        
+        if use_hg or use_fgn:
             utterance_features = {
                 "text": text_utt,
                 "audio": audio_utt,
                 "video": video_utt,
             }
-            updated_features = self.hypergraph(utterance_features, batch_dia_len)
-            text_utt = updated_features["text"]
-            audio_utt = updated_features["audio"]
-            video_utt = updated_features["video"]
+            
+            # 收集各分支输出
+            branch_outputs = {name: [] for name in self.modality_names}
+            
+            # 分支A：超图卷积
+            if use_hg:
+                hg_out = self.hypergraph(utterance_features, batch_dia_len)
+                for name in self.modality_names:
+                    branch_outputs[name].append(hg_out[name])
+            
+            # 分支B：FGN 频域网络
+            if use_fgn:
+                # FGN 需要节点序列输入 [N, D]
+                # 将三个模态的特征拼接成节点序列
+                node_sequence = torch.cat([
+                    utterance_features["text"],
+                    utterance_features["audio"],
+                    utterance_features["video"],
+                ], dim=0)  # [3*N, D]
+                
+                fgn_out = self.fgn(node_sequence)  # [3*N, D'] or [3*N, 2*D]
+                
+                # 分割回各模态
+                total_utts = sum(batch_dia_len)
+                fgn_text = fgn_out[:total_utts]
+                fgn_audio = fgn_out[total_utts:2*total_utts]
+                fgn_video = fgn_out[2*total_utts:]
+                
+                branch_outputs["text"].append(fgn_text)
+                branch_outputs["audio"].append(fgn_audio)
+                branch_outputs["video"].append(fgn_video)
+            
+            # 合并分支输出并投影
+            if self.branch_proj is not None:
+                for name in self.modality_names:
+                    combined = torch.cat(branch_outputs[name], dim=-1)
+                    branch_outputs[name] = self.branch_proj[name](combined)
+                
+                text_utt = branch_outputs["text"]
+                audio_utt = branch_outputs["audio"]
+                video_utt = branch_outputs["video"]
         
         # ====== 阶段7: 融合模态 ======
         # 将social和context投影到hidden_dim（即使不用于融合，也保留投影用于分析）
@@ -2055,13 +2439,8 @@ class MultimodalEmotionModel_Refactored(nn.Module):
         
         fused_embedding = self.modality_fusion(all_modalities)  # [B, fusion_H]
         
-        # ====== 阶段8: 频域分解 (GS-MCC) ======
-        if self.config.use_frequency_decomp:
-            low_freq, high_freq = self.freq_decomp(fused_embedding)
-            freq_combined = torch.cat([low_freq, high_freq], dim=-1)
-            fused_embedding = self.freq_fusion(freq_combined)
-            aux_outputs['low_freq'] = low_freq
-            aux_outputs['high_freq'] = high_freq
+        # ====== 阶段8: 频域分解已移到阶段6与超图并行 ======
+        # (不再在此处理)
         
         # ====== 阶段9: 超球体正则化 ======
         sphere_loss = torch.tensor(0.0, device=fused_embedding.device)
@@ -2087,6 +2466,18 @@ class MultimodalEmotionModel_Refactored(nn.Module):
             'social_embedding': social_proj,
             'context_embedding': context_proj,
         })
+        
+        # ⭐ KL散度多任务学习：计算单模态logits
+        if self.config.use_kl_mtl:
+            text_logits = self.text_classifier(text_utt)      # [B, num_labels]
+            audio_logits = self.audio_classifier(audio_utt)   # [B, num_labels]
+            video_logits = self.video_classifier(video_utt)   # [B, num_labels]
+            
+            aux_outputs.update({
+                'text_logits': text_logits,
+                'audio_logits': audio_logits,
+                'video_logits': video_logits,
+            })
         
         return logits, aux_outputs
 

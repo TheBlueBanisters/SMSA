@@ -39,35 +39,39 @@
 # ============================================================
 
 # --- 数据集选择 ---
-DATASET="meld"        # 数据集名称：chsims / chsimsv2 / meld
+# DATASET="chsimsv2"
+DATASET="meld"         # 数据集名称：chsims / chsimsv2 / meld / iemocap
                         # 会自动映射到对应的 _processed 子目录
-
+# DATASET="chsimsv2"  
 # --- 数据集根目录 ---
-DATA_DIR="./meld_10"           # 数据集根目录（一级目录，留空使用默认 ./data）
+DATA_DIR="./meld_10"  
+# DATA_DIR="./chsimsv2_101"           # 数据集根目录（一级目录，留空使用默认 ./data）
                         # 脚本会自动在此目录下查找 {dataset_name}_processed 子目录
                         # 示例：DATA_DIR="./data_new" + DATASET="meld" → ./data_new/meld_processed
 
 # --- GPU设置 ---
-GPU_ID=1               # 使用的GPU编号，多GPU用逗号分隔，如：0,1
+# GPU_ID=0  
+GPU_ID=1  
+           # 使用的GPU编号，多GPU用逗号分隔，如：0,1
 
 # --- 基础训练参数 ---
-# 注意：不同数据集有默认值，留空("")则使用数据集默认值，填写则覆盖默认值
-BATCH_SIZE="128"          # 批大小，留空使用默认值（chsims:32, chsimsv2:32, meld:16）
-LEARNING_RATE="1e-4"        # 学习率，留空使用默认值（chsims:1e-4, chsimsv2:1e-4, meld:5e-5）
-NUM_EPOCHS="150"         # 训练轮数，留空使用默认值（chsims:50, chsimsv2:50, meld:40）
-HIDDEN_DIM=""           # 隐藏层维度（默认：256）
-DROPOUT="0.1"              # Dropout率（默认：0.1）
-EARLY_STOP_PATIENCE="50" # 早停等待轮数（留空使用默认10，当前3，设为0禁用）⭐
-EARLY_STOP_METRIC="mae"    # 早停监控指标（留空使用默认mae，当前acc_2）⭐
-                        # 可选：mae（越小越好）、acc_2（越大越好）、acc_3、f1_2、f1_3、corr、loss
-SPHERE_LOSS_WEIGHT="0.001"   # 超球体损失权重（默认：0.01，建议范围：0.001-0.1）
+# 注意：不同数据集有默认值，留空("")则使用数据集默认值（推荐）
+SEQ_LENGTH=""             # 留空使用数据集默认 (CH-SIMS/v2=70, MELD=80, IEMOCAP=110)
+BATCH_SIZE=""             # 留空使用数据集默认 (CH-SIMS=32, MELD=16)
+LEARNING_RATE="5e-5"          # 留空使用数据集默认 (MELD=5e-5)
+NUM_EPOCHS="150"          # 训练轮数
+HIDDEN_DIM="2048"             # 留空使用默认 256
+DROPOUT="0.1"                # 留空使用默认 (MELD=0.4)
+EARLY_STOP_PATIENCE="50"  # 早停等待轮数
+EARLY_STOP_METRIC=""      # 留空自动选择 (Regression=mae, Classification=f1_weighted)
+SPHERE_LOSS_WEIGHT="0.001"
 
 # --- 测试集评估设置 ---
 EVAL_TEST_EVERY_EPOCH=true    # 是否在每个epoch后评估测试集（true=启用，false=禁用）⭐
                                 # 注意：仅用于监控，不影响早停和模型保存
 
 # --- 学习率调度器参数 ---
-SCHEDULER_TYPE="cosine"       # 学习率调度器类型（默认：cosine）⭐ 改为cosine，更稳定
+SCHEDULER_TYPE="reduce_on_plateau"       # 学习率调度器类型（默认：cosine）⭐ 改为cosine，更稳定
                         # 可选：cosine（余弦退火）、reduce_on_plateau（自适应）、step（固定步长）、留空（使用默认）
 SCHEDULER_GAMMA=""      # 学习率衰减系数（默认：0.5，用于step和reduce_on_plateau）
 SCHEDULER_PATIENCE=""   # 等待轮数（默认：5，仅用于reduce_on_plateau）⭐
@@ -82,16 +86,32 @@ FRAME_RATIO="70"         # ✓ 改进: 每段选择70%的帧（提高信息保�
                          # 示例：100帧视频，4段，60% -> 每段25帧选15帧 -> 总共60帧
 
 # --- MoE-FiLM 参数 ---
-NUM_FILM_EXPERTS="8"     # FiLM专家数量（默认：8）   16
-FILM_TOP_K="4"           # Top-K路由选择（默认：4）  8
+NUM_FILM_EXPERTS="4"     # FiLM专家数量（默认：8）   16
+FILM_TOP_K="2"           # Top-K路由选择（默认：4）  8
 MOE_LOSS_WEIGHT="0.1"   # ⭐ MoE负载均衡损失权重（默认：0.01，防止专家坍缩）
                          # 设为0关闭此损失
 
-# --- 超图建模（M3NET）参数 ---
-NUM_HG_LAYERS=""        # 超图卷积层数（默认：3）
+# --- CH-SIMSV2 多任务学习 (MTL) 参数 ---
+# 仅对 CH-SIMSV2 数据集生效
+CHSIMSV2_MTL_LAMBDA="0.1"  # 辅助任务（单模态标签）的损失权重
+                           # 0.0 = 不使用单模态辅助损失
+                           # 建议范围：0.1 - 0.5
 
-# --- 频域分解（GS-MCC）参数 ---
-NUM_FOURIER_LAYERS=""   # 傅里叶层数（默认：4）
+# --- 超图建模（M3NET）参数 ---
+NUM_HG_LAYERS="2"            # 超图卷积层数（M3NET原始使用3层）
+HG_USE_RESIDUE=true          # 拼接残差（M3NET原始方式）
+
+# --- 频域分解（GS-MCC / FGN）参数 ---
+NUM_FOURIER_LAYERS="2"       # 傅里叶卷积层数（GS-MCC原始使用3层）
+FGN_USE_RESIDUE=true         # FGN拼接残差（GS-MCC原始方式）
+F_SPARSITY_THRESHOLD="0.01"  # 傅里叶稀疏阈值
+F_HIDDEN_SIZE_FACTOR="2"     # 傅里叶隐藏层倍数
+
+# --- KL散度多任务学习（GS-MCC）参数 ---
+# ⭐ 让单模态预测去"模仿"融合后的预测（软标签蒸馏）
+USE_KL_MTL=true             # 是否启用KL散度多任务学习（true=启用，false=禁用）
+KL_MTL_WEIGHT="1.0"          # KL散度损失的权重（默认1.0）
+UNIMODAL_LOSS_WEIGHT="1.0"   # 单模态分类损失的权重（默认1.0）
 
 # --- 模态和关键帧分析参数 ---
 ENABLE_MODALITY_ANALYSIS=false  # 是否启用模态分析（true=启用，false=禁用）⭐
@@ -103,21 +123,82 @@ ENABLE_KEYFRAME_LOGGING=false   # 是否启用关键帧统计（true=启用，fa
 # --- 组件开关（true=关闭该组件，false或留空=使用该组件）---
 NO_KEY_FRAME_SELECTOR=true    # 关闭关键帧选择
 NO_COUPLED_MAMBA=false         # 关闭Coupled Mamba（使用独立Mamba）
-NO_MOE_FILM=false              # 关闭MoE-FiLM调制
+NO_MOE_FILM=true             # 关闭MoE-FiLM调制
 NO_HYPERGRAPH=false            # 关闭超图建模
-NO_FREQUENCY_DECOMP=true      # 关闭频域分解
-NO_SPHERE_REG=true            # 关闭超球体正则化
+                               # ⚠️ 启用超图建模(false)会自动启用对话级batching
+MAX_UTTERANCES_PER_BATCH=256   # ⭐ 每批最大utterance数（控制显存，防止OOM）
+MAX_DIALOGUE_LEN=200           # 单个对话最大utterance数（超过的对话会被跳过）
+NO_FREQUENCY_DECOMP=false      # 关闭频域分解
+NO_SPHERE_REG=true         # 关闭超球体正则化
 NO_DIRECT_FUSION_PRIORS=true  # ⭐ 禁止social/context直接参与融合（只用于调制）
                                # true=social/context只用于FiLM调制，不送入最终MLP融合
                                # false=social/context既用于调制，也参与融合（原始行为）
+
+# --- DSPS（条件化SSM）开关 ---
+NO_DSPS=false                  # ⭐ DSPS条件化SSM开关（与其他开关风格一致）
+                               # true=关闭DSPS（使用标准Mamba，默认）
+                               # false=启用DSPS（在Mamba内部的dt/B/C路径注入条件）
+                               # ⚠️ 重要：NO_DSPS=false 时必须同时设置 NO_MOE_FILM=true
+                               #         MoE-FiLM 与 DSPS 互斥，不能同时启用！
+DSPS_STRENGTH=0.5              # DSPS强度因子（0.0=无效果，1.0=完全效果）
+                               # 建议从0.1开始，根据实验调整
 
 # --- MLP架构选择 ---
 USE_IMPROVED_MLP=true
          # ⭐ MLP架构选择（true=改进版，false=原始版）
                                # true=改进版：4层深层MLP + GELU + 残差 + LayerNorm（容量大，性能可能更好）
                                # false=原始版：2层简单MLP + ReLU（容量小，更稳定，当前使用）
-MLP_DROPOUT=0.2              # 改进版MLP的Dropout比例（默认0.2）
+MLP_DROPOUT=0.1              # 改进版MLP的Dropout比例（默认0.2）
 MLP_EXPANSION_RATIO=4        # 改进版MLP中间层扩维倍数（默认4，即中间层=输入×4）
+
+# --- 混合回放池 (Experience Replay) ---
+USE_REPLAY_BUFFER=true        # ⭐ 混合回放池开关
+                               # true=启用（类似DQN的经验回放，关注高loss难样本）
+                               # false=禁用（默认）
+REPLAY_BUFFER_THRESHOLD="1.3"  # Loss阈值倍数（batch_loss > avg_loss * threshold 时加入池）
+REPLAY_BUFFER_RATIO="0.3"      # 回放比例（每epoch额外训练20%的难样本batch）
+REPLAY_BUFFER_MAX_SIZE="500"   # 回放池最大容量
+
+# --- 类别权重设置（分类任务） ---
+# ⭐ 用于处理 MELD 等数据集的类别不平衡问题
+USE_CLASS_WEIGHTS="true"         # 类别权重开关：
+                            #   ""（留空）= 使用数据集默认值（MELD默认开启）
+                            #   true      = 强制开启（给少数类更高权重）
+                            #   false     = 强制关闭（所有类别权重相等）
+
+# --- 采样与损失函数增强 (Updated) ---
+# 针对类别不平衡（特别是IEMOCAP负样本多）的优化
+USE_WEIGHTED_SAMPLER="true"     # 是否使用加权随机采样（解决类别不平衡）
+                            #   "" (留空) = 使用数据集默认（IEMOCAP默认开启）
+                            #   true      = 强制开启 (注意：会禁用shuffle)
+                            #   false     = 强制关闭
+
+LABEL_SMOOTHING="0.1"          # 标签平滑系数 (防止过拟合)
+                            #   "" (留空) = 使用数据集默认（IEMOCAP默认0.1）
+                            #   0.0       = 关闭
+                            #   0.1       = 推荐值
+
+# --- Focal Loss 设置（分类任务） ---
+# ⭐ Focal Loss 用于处理类别不平衡，让模型更关注难分类的样本
+# 仅对 MELD 和 IEMOCAP 等分类任务生效
+USE_FOCAL_LOSS="true"              # Focal Loss 开关：
+                            #   "" (留空) = 使用数据集默认配置（MELD默认开启）
+                            #   true      = 强制开启 (loss_function=focal)
+                            #   false     = 强制关闭 (loss_function=ce)
+FOCAL_LOSS_GAMMA="2.0"       # Focal Loss 的 gamma 参数（默认：2.0
+                            # 如果启用动态gamma，这是初始值
+
+# --- 动态 Focal Loss Gamma 衰减 (新功能) ---
+# ⭐ 让 gamma 随训练进度逐渐衰减，平衡少数类和多数类的学习
+# 训练初期：高 gamma → 快速学习少数类特征
+# 训练后期：低 gamma → 恢复多数类（neutral）的置信度
+FOCAL_DYNAMIC_GAMMA=true     # 是否启用动态gamma衰减（false=关闭，true=开启）
+FOCAL_GAMMA_MIN="0.5"         # gamma 衰减的最小值（默认：0.5）
+FOCAL_GAMMA_DECAY_MODE="exponential"  # gamma 衰减模式：
+                            #   linear      = 线性衰减（匀速）
+                            #   exponential = 指数衰减（先快后慢）
+                            #   cosine      = 余弦衰减（先慢后快再慢，推荐）
+                            #   step        = 阶梯式衰减（分3段降低）
 
 # --- 课程学习 (Curriculum Learning) 设置 ---
 # ⭐ 用于解决 Mamba Backbone 与 MoE 模块协同训练时的不稳定问题（特别是 Acc-5 掉点问题）
@@ -125,7 +206,7 @@ CURRICULUM_MODE="freeze_backbone"       # 课程学习模式：
                              #   none           = 关闭课程学习（默认行为，与之前完全兼容）
                              #   freeze_backbone = 策略A：冻结骨干网络，只训练MoE/FiLM/Head
                              #   alpha_blending  = 策略B：渐进式MoE混合（alpha从0.2→1.0）
-CURRICULUM_EPOCHS=5          # 课程学习持续的Epoch数（默认：5）
+CURRICULUM_EPOCHS=10          # 课程学习持续的Epoch数（默认：5）
                              # freeze_backbone: 前N个epoch冻结Backbone，之后解冻
                              # alpha_blending:  alpha = min(1.0, epoch / N)
 
@@ -134,13 +215,9 @@ USE_NOHUP=true          # 使用nohup后台运行（SSH断开后继续训练）
                         # true=后台运行，false=前台运行
 
 # --- 训练曲线绘图设置 ---
-PLOT_MAE=true           # 绘制 MAE 曲线图
-PLOT_ACC2=true          # 绘制 Acc-2 (二分类准确率) 曲线图
-PLOT_ACC3=true          # 绘制 Acc-3 (三分类准确率) 曲线图
-PLOT_ACC5=true          # 绘制 Acc-5 (五分类准确率) 曲线图
-PLOT_LOSS=true          # 绘制 Loss 曲线图
-PLOT_CORR=false         # 绘制 Correlation 曲线图
-PLOT_ALL=false          # 绘制所有指标（true时忽略上面的单独开关）
+ENABLE_PLOTTING=true    # 是否启用训练曲线绘图（自动根据数据集选择合适指标）
+                        # 回归任务(CH-SIMS/v2): MAE, Loss, Corr, Acc-2/3/5
+                        # 分类任务(MELD/IEMOCAP): Loss, Acc, F1_weighted, F1_macro
 
 # --- 其他参数 ---
 # 注意：以下参数在配置文件(config_refactored.py)中设置，不通过命令行传递
@@ -154,7 +231,7 @@ SEED=42                 # 随机种子（在配置文件中生效）
 # 处理命令行参数
 if [ $# -ge 1 ]; then
     # 如果提供了命令行参数，检查第一个参数是否是数据集名称
-    if [[ "$1" =~ ^(chsims|chsimsv2|meld)$ ]]; then
+    if [[ "$1" =~ ^(chsims|chsimsv2|meld|iemocap)$ ]]; then
         DATASET=$1
         shift  # 移除第一个参数，剩余的作为额外选项
         echo "使用命令行指定的数据集: $DATASET（覆盖配置文件）"
@@ -168,17 +245,18 @@ else
 fi
 
 # 验证数据集名称
-if [[ ! "$DATASET" =~ ^(chsims|chsimsv2|meld)$ ]]; then
+if [[ ! "$DATASET" =~ ^(chsims|chsimsv2|meld|iemocap)$ ]]; then
     echo ""
     echo "=========================================="
     echo "错误：无效的数据集名称: '$DATASET'"
     echo "=========================================="
-    echo "可用的数据集: chsims, chsimsv2, meld"
+    echo "可用的数据集: chsims, chsimsv2, meld, iemocap"
     echo ""
     echo "请在脚本第20行修改 DATASET 变量，或使用命令行参数："
     echo "  bash train_unified.sh chsims"
     echo "  bash train_unified.sh chsimsv2"
     echo "  bash train_unified.sh meld"
+    echo "  bash train_unified.sh iemocap"
     exit 1
 fi
 
@@ -319,6 +397,14 @@ case $DATASET in
         DEFAULT_LR=5e-5
         DEFAULT_EPOCHS=40
         ;;
+    iemocap)
+        echo "=========================================="
+        echo "Training on IEMOCAP dataset"
+        echo "=========================================="
+        DEFAULT_BATCH_SIZE=16
+        DEFAULT_LR=5e-5
+        DEFAULT_EPOCHS=50
+        ;;
 esac
 
 # 使用配置变量或默认值
@@ -343,6 +429,9 @@ if [ -n "$DATA_DIR" ]; then
         meld)
             DATASET_SUBDIR="meld"
             ;;
+        iemocap)
+            DATASET_SUBDIR="iemocap"
+            ;;
     esac
     FULL_DATA_DIR="${DATA_DIR}/${DATASET_SUBDIR}"
     echo "数据目录: $FULL_DATA_DIR"
@@ -350,12 +439,14 @@ fi
 
 # 添加可选参数（只有在设置了值时才添加）
 [ -n "$FULL_DATA_DIR" ] && DATASET_ARGS="$DATASET_ARGS --data_dir $FULL_DATA_DIR"
+[ -n "$SEQ_LENGTH" ] && DATASET_ARGS="$DATASET_ARGS --seq_length $SEQ_LENGTH"
 [ -n "$HIDDEN_DIM" ] && DATASET_ARGS="$DATASET_ARGS --hidden_dim $HIDDEN_DIM"
 [ -n "$DROPOUT" ] && DATASET_ARGS="$DATASET_ARGS --dropout_p $DROPOUT"
 [ -n "$EARLY_STOP_PATIENCE" ] && DATASET_ARGS="$DATASET_ARGS --early_stop_patience $EARLY_STOP_PATIENCE"
 [ -n "$EARLY_STOP_METRIC" ] && DATASET_ARGS="$DATASET_ARGS --early_stop_metric $EARLY_STOP_METRIC"
 [ -n "$SPHERE_LOSS_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --sphere_loss_weight $SPHERE_LOSS_WEIGHT"
 [ -n "$MOE_LOSS_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --moe_loss_weight $MOE_LOSS_WEIGHT"
+[ -n "$CHSIMSV2_MTL_LAMBDA" ] && DATASET_ARGS="$DATASET_ARGS --chsimsv2_mtl_lambda $CHSIMSV2_MTL_LAMBDA"
 
 # 学习率调度器参数
 [ -n "$SCHEDULER_TYPE" ] && DATASET_ARGS="$DATASET_ARGS --scheduler_type $SCHEDULER_TYPE"
@@ -368,7 +459,19 @@ fi
 [ -n "$NUM_FILM_EXPERTS" ] && DATASET_ARGS="$DATASET_ARGS --num_film_experts $NUM_FILM_EXPERTS"
 [ -n "$FILM_TOP_K" ] && DATASET_ARGS="$DATASET_ARGS --film_top_k $FILM_TOP_K"
 [ -n "$NUM_HG_LAYERS" ] && DATASET_ARGS="$DATASET_ARGS --num_hypergraph_layers $NUM_HG_LAYERS"
+[ "$HG_USE_RESIDUE" = true ] && DATASET_ARGS="$DATASET_ARGS --hypergraph_use_residue"
+[ "$HG_USE_RESIDUE" = false ] && DATASET_ARGS="$DATASET_ARGS --hypergraph_no_residue"
+# 频域分解（GS-MCC / FGN）参数
 [ -n "$NUM_FOURIER_LAYERS" ] && DATASET_ARGS="$DATASET_ARGS --num_fourier_layers $NUM_FOURIER_LAYERS"
+[ "$FGN_USE_RESIDUE" = true ] && DATASET_ARGS="$DATASET_ARGS --fgn_use_residue"
+[ "$FGN_USE_RESIDUE" = false ] && DATASET_ARGS="$DATASET_ARGS --fgn_no_residue"
+[ -n "$F_SPARSITY_THRESHOLD" ] && DATASET_ARGS="$DATASET_ARGS --fourier_sparsity_threshold $F_SPARSITY_THRESHOLD"
+[ -n "$F_HIDDEN_SIZE_FACTOR" ] && DATASET_ARGS="$DATASET_ARGS --fourier_hidden_size_factor $F_HIDDEN_SIZE_FACTOR"
+
+# KL散度多任务学习参数
+[ "$USE_KL_MTL" = true ] && DATASET_ARGS="$DATASET_ARGS --use_kl_mtl"
+[ -n "$KL_MTL_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --kl_mtl_weight $KL_MTL_WEIGHT"
+[ -n "$UNIMODAL_LOSS_WEIGHT" ] && DATASET_ARGS="$DATASET_ARGS --unimodal_loss_weight $UNIMODAL_LOSS_WEIGHT"
 
 # 测试集评估参数
 [ "$EVAL_TEST_EVERY_EPOCH" = true ] && DATASET_ARGS="$DATASET_ARGS --eval_test_every_epoch"
@@ -381,21 +484,73 @@ fi
 [ "$ENABLE_KEYFRAME_LOGGING" = true ] && DATASET_ARGS="$DATASET_ARGS --enable_keyframe_logging"
 # 注意：NUM_WORKERS 和 SEED 在配置文件中设置，不需要命令行传递
 
-# 添加组件开关
+# 添加组件开关（关闭类：NO_XXX=true 时传递 --no_xxx）
 [ "$NO_KEY_FRAME_SELECTOR" = true ] && DATASET_ARGS="$DATASET_ARGS --no_key_frame_selector"
 [ "$NO_COUPLED_MAMBA" = true ] && DATASET_ARGS="$DATASET_ARGS --no_coupled_mamba"
 [ "$NO_MOE_FILM" = true ] && DATASET_ARGS="$DATASET_ARGS --no_moe_film"
-[ "$NO_HYPERGRAPH" = true ] && DATASET_ARGS="$DATASET_ARGS --no_hypergraph"
-[ "$NO_FREQUENCY_DECOMP" = true ] && DATASET_ARGS="$DATASET_ARGS --no_frequency_decomp"
-[ "$NO_SPHERE_REG" = true ] && DATASET_ARGS="$DATASET_ARGS --no_sphere_reg"
 [ "$NO_DIRECT_FUSION_PRIORS" = true ] && DATASET_ARGS="$DATASET_ARGS --no_direct_fusion_priors"
+
+# 添加组件开关（开启类：NO_XXX=false 时传递 --use_xxx，用于开启默认关闭的组件）
+[ "$NO_HYPERGRAPH" = false ] && DATASET_ARGS="$DATASET_ARGS --use_hypergraph"
+[ "$NO_FREQUENCY_DECOMP" = false ] && DATASET_ARGS="$DATASET_ARGS --use_frequency_decomp"
+[ "$NO_SPHERE_REG" = false ] && DATASET_ARGS="$DATASET_ARGS --use_sphere_reg"
+
+# 对话级 batching 参数（超图建模时自动启用）
+if [ "$NO_HYPERGRAPH" = false ]; then
+    DATASET_ARGS="$DATASET_ARGS --max_utterances_per_batch $MAX_UTTERANCES_PER_BATCH"
+    DATASET_ARGS="$DATASET_ARGS --max_dialogue_len $MAX_DIALOGUE_LEN"
+fi
+
+# MLP 参数
 [ "$USE_IMPROVED_MLP" = true ] && DATASET_ARGS="$DATASET_ARGS --use_improved_mlp"
 [ -n "$MLP_DROPOUT" ] && DATASET_ARGS="$DATASET_ARGS --mlp_dropout $MLP_DROPOUT"
 [ -n "$MLP_EXPANSION_RATIO" ] && DATASET_ARGS="$DATASET_ARGS --mlp_expansion_ratio $MLP_EXPANSION_RATIO"
 
+# 混合回放池参数
+[ "$USE_REPLAY_BUFFER" = true ] && DATASET_ARGS="$DATASET_ARGS --use_replay_buffer"
+[ "$USE_REPLAY_BUFFER" = false ] && DATASET_ARGS="$DATASET_ARGS --no_replay_buffer"
+[ -n "$REPLAY_BUFFER_THRESHOLD" ] && DATASET_ARGS="$DATASET_ARGS --replay_buffer_threshold $REPLAY_BUFFER_THRESHOLD"
+[ -n "$REPLAY_BUFFER_RATIO" ] && DATASET_ARGS="$DATASET_ARGS --replay_buffer_ratio $REPLAY_BUFFER_RATIO"
+[ -n "$REPLAY_BUFFER_MAX_SIZE" ] && DATASET_ARGS="$DATASET_ARGS --replay_buffer_max_size $REPLAY_BUFFER_MAX_SIZE"
+
+# 类别权重参数
+[ "$USE_CLASS_WEIGHTS" = true ] && DATASET_ARGS="$DATASET_ARGS --use_class_weights"
+[ "$USE_CLASS_WEIGHTS" = false ] && DATASET_ARGS="$DATASET_ARGS --no_class_weights"
+
+# 加权采样参数
+[ "$USE_WEIGHTED_SAMPLER" = true ] && DATASET_ARGS="$DATASET_ARGS --use_weighted_sampler"
+[ "$USE_WEIGHTED_SAMPLER" = false ] && DATASET_ARGS="$DATASET_ARGS --no_weighted_sampler"
+
+# 标签平滑参数
+[ -n "$LABEL_SMOOTHING" ] && DATASET_ARGS="$DATASET_ARGS --label_smoothing $LABEL_SMOOTHING"
+
+# Focal Loss 参数（分类任务）
+if [ "$USE_FOCAL_LOSS" = true ]; then
+    DATASET_ARGS="$DATASET_ARGS --loss_function focal"
+    [ -n "$FOCAL_LOSS_GAMMA" ] && DATASET_ARGS="$DATASET_ARGS --focal_gamma $FOCAL_LOSS_GAMMA"
+    
+    # 动态 Gamma 参数
+    if [ "$FOCAL_DYNAMIC_GAMMA" = true ]; then
+        DATASET_ARGS="$DATASET_ARGS --focal_dynamic_gamma"
+        [ -n "$FOCAL_GAMMA_MIN" ] && DATASET_ARGS="$DATASET_ARGS --focal_gamma_min $FOCAL_GAMMA_MIN"
+        [ -n "$FOCAL_GAMMA_DECAY_MODE" ] && DATASET_ARGS="$DATASET_ARGS --focal_gamma_decay_mode $FOCAL_GAMMA_DECAY_MODE"
+    fi
+elif [ "$USE_FOCAL_LOSS" = false ]; then
+    # 如果强制关闭，对于分类任务使用标准交叉熵
+    if [[ "$DATASET" == "meld" || "$DATASET" == "iemocap" ]]; then
+        DATASET_ARGS="$DATASET_ARGS --loss_function ce"
+    fi
+fi
+
 # 课程学习参数
 [ -n "$CURRICULUM_MODE" ] && [ "$CURRICULUM_MODE" != "none" ] && DATASET_ARGS="$DATASET_ARGS --curriculum_mode $CURRICULUM_MODE"
 [ -n "$CURRICULUM_EPOCHS" ] && [ "$CURRICULUM_MODE" != "none" ] && DATASET_ARGS="$DATASET_ARGS --curriculum_epochs $CURRICULUM_EPOCHS"
+
+# DSPS（条件化SSM）参数（注意：NO_DSPS=false 表示启用）
+if [ "$NO_DSPS" = false ]; then
+    DATASET_ARGS="$DATASET_ARGS --use_dsps"
+    DATASET_ARGS="$DATASET_ARGS --dsps_strength $DSPS_STRENGTH"
+fi
 
 # 为多GPU并行训练创建独立目录
 # 使用GPU_ID作为目录后缀来避免冲突
@@ -452,6 +607,7 @@ echo "GPU: $GPU_ID"
 echo "运行目录: $RUN_DIR"
 echo ""
 echo "基础参数:"
+echo "  序列长度: ${SEQ_LENGTH:-'(默认)'}"
 echo "  批大小: $FINAL_BATCH_SIZE"
 echo "  学习率: $FINAL_LR"
 echo "  训练轮数: $FINAL_EPOCHS"
@@ -463,10 +619,56 @@ echo "组件状态:"
 echo "  关键帧选择: $([ "$NO_KEY_FRAME_SELECTOR" = true ] && echo '关闭' || echo '开启')"
 echo "  Coupled Mamba: $([ "$NO_COUPLED_MAMBA" = true ] && echo '关闭' || echo '开启')"
 echo "  MoE-FiLM: $([ "$NO_MOE_FILM" = true ] && echo '关闭' || echo '开启')"
+echo "  DSPS (条件化SSM): $([ "$NO_DSPS" = true ] && echo '关闭' || echo "开启 (strength=$DSPS_STRENGTH)")"
+if [ "$DATASET" = "chsimsv2" ]; then
+    echo "  CH-SIMSv2 MTL: $([ "$CHSIMSV2_MTL_LAMBDA" != "0.0" ] && echo "开启 (lambda=$CHSIMSV2_MTL_LAMBDA)" || echo '关闭')"
+fi
 echo "  超图建模: $([ "$NO_HYPERGRAPH" = true ] && echo '关闭' || echo '开启')"
+if [ "$NO_HYPERGRAPH" = false ]; then
+    echo "    - 对话级batching: 开启（动态BatchSampler）"
+    echo "    - 每批最大utterances: $MAX_UTTERANCES_PER_BATCH"
+    echo "    - 最大对话长度: $MAX_DIALOGUE_LEN"
+fi
 echo "  频域分解: $([ "$NO_FREQUENCY_DECOMP" = true ] && echo '关闭' || echo '开启')"
+if [ "$NO_FREQUENCY_DECOMP" = false ]; then
+    echo "    - 傅里叶层数: $NUM_FOURIER_LAYERS"
+    echo "    - 拼接残差: $([ "$FGN_USE_RESIDUE" = true ] && echo '开启' || echo '关闭')"
+fi
+echo "  KL散度多任务: $([ "$USE_KL_MTL" = true ] && echo "开启 (kl=$KL_MTL_WEIGHT, uni=$UNIMODAL_LOSS_WEIGHT)" || echo '关闭')"
 echo "  超球体正则: $([ "$NO_SPHERE_REG" = true ] && echo '关闭' || echo '开启')"
 echo "  先验直接融合: $([ "$NO_DIRECT_FUSION_PRIORS" = true ] && echo '关闭(只调制)' || echo '开启')"
+echo ""
+echo "类别不平衡处理:"
+if [ -z "$USE_CLASS_WEIGHTS" ]; then
+    echo "  类别权重: 使用数据集默认值（MELD默认开启）"
+elif [ "$USE_CLASS_WEIGHTS" = true ]; then
+    echo "  类别权重: 强制开启"
+else
+    echo "  类别权重: 强制关闭"
+fi
+if [ -z "$USE_FOCAL_LOSS" ]; then
+    echo "  Focal Loss: 使用数据集默认值（MELD默认开启）"
+elif [ "$USE_FOCAL_LOSS" = true ]; then
+    if [ "$FOCAL_DYNAMIC_GAMMA" = true ]; then
+        echo "  Focal Loss: 强制开启 (动态gamma: $FOCAL_LOSS_GAMMA→$FOCAL_GAMMA_MIN, mode=$FOCAL_GAMMA_DECAY_MODE)"
+    else
+        echo "  Focal Loss: 强制开启 (gamma=$FOCAL_LOSS_GAMMA)"
+    fi
+else
+    echo "  Focal Loss: 强制关闭"
+fi
+if [ -z "$USE_WEIGHTED_SAMPLER" ]; then
+    echo "  加权采样: 使用数据集默认值（IEMOCAP默认开启）"
+elif [ "$USE_WEIGHTED_SAMPLER" = true ]; then
+    echo "  加权采样: 强制开启"
+else
+    echo "  加权采样: 强制关闭"
+fi
+if [ -n "$LABEL_SMOOTHING" ]; then
+    echo "  标签平滑: $LABEL_SMOOTHING"
+else
+    echo "  标签平滑: 使用数据集默认值"
+fi
 echo ""
 echo "学习率调度:"
 echo "  调度器类型: ${SCHEDULER_TYPE:-cosine}"
@@ -476,6 +678,14 @@ echo "MLP架构:"
 echo "  版本: $([ "$USE_IMPROVED_MLP" = true ] && echo '改进版(4层深层+GELU+残差)' || echo '原始版(2层简单+ReLU)')"
 echo "  Dropout: $MLP_DROPOUT"
 echo "  扩维倍数: $MLP_EXPANSION_RATIO"
+echo ""
+echo "混合回放池 (Experience Replay):"
+echo "  启用: $([ "$USE_REPLAY_BUFFER" = true ] && echo '是' || echo '否')"
+if [ "$USE_REPLAY_BUFFER" = true ]; then
+    echo "  Loss阈值倍数: $REPLAY_BUFFER_THRESHOLD"
+    echo "  回放比例: $REPLAY_BUFFER_RATIO"
+    echo "  最大容量: $REPLAY_BUFFER_MAX_SIZE"
+fi
 echo ""
 echo "课程学习 (Curriculum Learning):"
 if [ "$CURRICULUM_MODE" = "none" ] || [ -z "$CURRICULUM_MODE" ]; then
@@ -494,15 +704,15 @@ echo "  模态贡献度分析: $([ "$ENABLE_MODALITY_ANALYSIS" = true ] && echo 
 echo "  关键帧统计: $([ "$ENABLE_KEYFRAME_LOGGING" = true ] && echo "开启 (每${KEYFRAME_LOG_EVERY}个utterance)" || echo '关闭')"
 echo ""
 echo "训练曲线绘图:"
-if [ "$PLOT_ALL" = true ]; then
-    echo "  绘制所有指标: 开启"
+if [ "$ENABLE_PLOTTING" = true ]; then
+    echo "  状态: 开启（自动选择指标）"
+    if [[ "$DATASET" == "meld" || "$DATASET" == "iemocap" ]]; then
+        echo "  指标: Loss, Acc, F1_weighted, F1_macro"
+    else
+        echo "  指标: MAE, Loss, Corr, Acc-2/3/5"
+    fi
 else
-    echo "  MAE曲线: $([ "$PLOT_MAE" = true ] && echo '开启' || echo '关闭')"
-    echo "  Acc-2曲线: $([ "$PLOT_ACC2" = true ] && echo '开启' || echo '关闭')"
-    echo "  Acc-3曲线: $([ "$PLOT_ACC3" = true ] && echo '开启' || echo '关闭')"
-    echo "  Acc-5曲线: $([ "$PLOT_ACC5" = true ] && echo '开启' || echo '关闭')"
-    echo "  Loss曲线: $([ "$PLOT_LOSS" = true ] && echo '开启' || echo '关闭')"
-    echo "  Corr曲线: $([ "$PLOT_CORR" = true ] && echo '开启' || echo '关闭')"
+    echo "  状态: 关闭"
 fi
 echo ""
 [ $# -gt 0 ] && echo "额外命令行参数: $@" && echo ""
@@ -535,6 +745,7 @@ echo "GPU_ID=$GPU_ID" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 基础训练参数 ---" >> "$METRICS_FILE"
+echo "SEQ_LENGTH=\"$SEQ_LENGTH\"" >> "$METRICS_FILE"
 echo "BATCH_SIZE=\"$BATCH_SIZE\"" >> "$METRICS_FILE"
 echo "LEARNING_RATE=\"$LEARNING_RATE\"" >> "$METRICS_FILE"
 echo "NUM_EPOCHS=\"$NUM_EPOCHS\"" >> "$METRICS_FILE"
@@ -566,14 +777,25 @@ echo "# --- MoE-FiLM 参数 ---" >> "$METRICS_FILE"
 echo "NUM_FILM_EXPERTS=\"$NUM_FILM_EXPERTS\"" >> "$METRICS_FILE"
 echo "FILM_TOP_K=\"$FILM_TOP_K\"" >> "$METRICS_FILE"
 echo "MOE_LOSS_WEIGHT=\"$MOE_LOSS_WEIGHT\"" >> "$METRICS_FILE"
+echo "CHSIMSV2_MTL_LAMBDA=\"$CHSIMSV2_MTL_LAMBDA\"" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 超图建模（M3NET）参数 ---" >> "$METRICS_FILE"
 echo "NUM_HG_LAYERS=\"$NUM_HG_LAYERS\"" >> "$METRICS_FILE"
+echo "HG_USE_RESIDUE=$HG_USE_RESIDUE" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
-echo "# --- 频域分解（GS-MCC）参数 ---" >> "$METRICS_FILE"
+echo "# --- 频域分解（GS-MCC / FGN）参数 ---" >> "$METRICS_FILE"
 echo "NUM_FOURIER_LAYERS=\"$NUM_FOURIER_LAYERS\"" >> "$METRICS_FILE"
+echo "FGN_USE_RESIDUE=$FGN_USE_RESIDUE" >> "$METRICS_FILE"
+echo "F_SPARSITY_THRESHOLD=\"$F_SPARSITY_THRESHOLD\"" >> "$METRICS_FILE"
+echo "F_HIDDEN_SIZE_FACTOR=\"$F_HIDDEN_SIZE_FACTOR\"" >> "$METRICS_FILE"
+echo "" >> "$METRICS_FILE"
+
+echo "# --- KL散度多任务学习（GS-MCC）参数 ---" >> "$METRICS_FILE"
+echo "USE_KL_MTL=$USE_KL_MTL" >> "$METRICS_FILE"
+echo "KL_MTL_WEIGHT=\"$KL_MTL_WEIGHT\"" >> "$METRICS_FILE"
+echo "UNIMODAL_LOSS_WEIGHT=\"$UNIMODAL_LOSS_WEIGHT\"" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 模态和关键帧分析参数 ---" >> "$METRICS_FILE"
@@ -588,10 +810,21 @@ echo "# --- 组件开关 ---" >> "$METRICS_FILE"
 echo "NO_KEY_FRAME_SELECTOR=$NO_KEY_FRAME_SELECTOR" >> "$METRICS_FILE"
 echo "NO_COUPLED_MAMBA=$NO_COUPLED_MAMBA" >> "$METRICS_FILE"
 echo "NO_MOE_FILM=$NO_MOE_FILM" >> "$METRICS_FILE"
+echo "NO_DSPS=$NO_DSPS" >> "$METRICS_FILE"
+echo "DSPS_STRENGTH=$DSPS_STRENGTH" >> "$METRICS_FILE"
 echo "NO_HYPERGRAPH=$NO_HYPERGRAPH" >> "$METRICS_FILE"
 echo "NO_FREQUENCY_DECOMP=$NO_FREQUENCY_DECOMP" >> "$METRICS_FILE"
 echo "NO_SPHERE_REG=$NO_SPHERE_REG" >> "$METRICS_FILE"
 echo "NO_DIRECT_FUSION_PRIORS=$NO_DIRECT_FUSION_PRIORS" >> "$METRICS_FILE"
+echo "" >> "$METRICS_FILE"
+
+echo "# --- 类别权重设置 ---" >> "$METRICS_FILE"
+echo "USE_CLASS_WEIGHTS=\"$USE_CLASS_WEIGHTS\"" >> "$METRICS_FILE"
+echo "USE_FOCAL_LOSS=$USE_FOCAL_LOSS" >> "$METRICS_FILE"
+echo "FOCAL_LOSS_GAMMA=\"$FOCAL_LOSS_GAMMA\"" >> "$METRICS_FILE"
+echo "FOCAL_DYNAMIC_GAMMA=$FOCAL_DYNAMIC_GAMMA" >> "$METRICS_FILE"
+echo "FOCAL_GAMMA_MIN=\"$FOCAL_GAMMA_MIN\"" >> "$METRICS_FILE"
+echo "FOCAL_GAMMA_DECAY_MODE=\"$FOCAL_GAMMA_DECAY_MODE\"" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- MLP架构选择 ---" >> "$METRICS_FILE"
@@ -600,19 +833,20 @@ echo "MLP_DROPOUT=$MLP_DROPOUT" >> "$METRICS_FILE"
 echo "MLP_EXPANSION_RATIO=$MLP_EXPANSION_RATIO" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
+echo "# --- 混合回放池 ---" >> "$METRICS_FILE"
+echo "USE_REPLAY_BUFFER=$USE_REPLAY_BUFFER" >> "$METRICS_FILE"
+echo "REPLAY_BUFFER_THRESHOLD=$REPLAY_BUFFER_THRESHOLD" >> "$METRICS_FILE"
+echo "REPLAY_BUFFER_RATIO=$REPLAY_BUFFER_RATIO" >> "$METRICS_FILE"
+echo "REPLAY_BUFFER_MAX_SIZE=$REPLAY_BUFFER_MAX_SIZE" >> "$METRICS_FILE"
+echo "" >> "$METRICS_FILE"
+
 echo "# --- 课程学习 (Curriculum Learning) 设置 ---" >> "$METRICS_FILE"
 echo "CURRICULUM_MODE=\"$CURRICULUM_MODE\"" >> "$METRICS_FILE"
 echo "CURRICULUM_EPOCHS=$CURRICULUM_EPOCHS" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 训练曲线绘图设置 ---" >> "$METRICS_FILE"
-echo "PLOT_MAE=$PLOT_MAE" >> "$METRICS_FILE"
-echo "PLOT_ACC2=$PLOT_ACC2" >> "$METRICS_FILE"
-echo "PLOT_ACC3=$PLOT_ACC3" >> "$METRICS_FILE"
-echo "PLOT_ACC5=$PLOT_ACC5" >> "$METRICS_FILE"
-echo "PLOT_LOSS=$PLOT_LOSS" >> "$METRICS_FILE"
-echo "PLOT_CORR=$PLOT_CORR" >> "$METRICS_FILE"
-echo "PLOT_ALL=$PLOT_ALL" >> "$METRICS_FILE"
+echo "ENABLE_PLOTTING=$ENABLE_PLOTTING" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
 echo "# --- 后台运行设置 ---" >> "$METRICS_FILE"
@@ -630,18 +864,9 @@ echo "训练指标记录" >> "$METRICS_FILE"
 echo "========================================" >> "$METRICS_FILE"
 echo "" >> "$METRICS_FILE"
 
-# 构建绘图参数
+# 构建绘图参数（简化为单个开关）
 PLOT_ARGS=""
-if [ "$PLOT_ALL" = true ]; then
-    PLOT_ARGS="--plot_all"
-else
-    [ "$PLOT_MAE" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_mae"
-    [ "$PLOT_ACC2" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc2"
-    [ "$PLOT_ACC3" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc3"
-    [ "$PLOT_ACC5" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_acc5"
-    [ "$PLOT_LOSS" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_loss"
-    [ "$PLOT_CORR" = true ] && PLOT_ARGS="$PLOT_ARGS --plot_corr"
-fi
+[ "$ENABLE_PLOTTING" = true ] && PLOT_ARGS="--enable_plotting"
 
 # 训练命令（使用本次训练的独立目录）
 TRAIN_CMD="python train_refactored.py $COMMON_ARGS $DATASET_ARGS --metrics_file $METRICS_FILE --save_dir $CHECKPOINT_BASE_DIR --log_dir $LOG_BASE_DIR $PLOT_ARGS $@"

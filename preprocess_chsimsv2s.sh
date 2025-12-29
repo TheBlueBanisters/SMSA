@@ -9,7 +9,7 @@
 # 配置参数
 DATASET="chsimsv2"
 INPUT_DIR="./chsimsv2/ch-simsv2s"           # CH-SIMSV2原始数据目录
-OUTPUT_DIR="./chsimsv2_10"     # 处理后的数据输出目录
+OUTPUT_DIR="./chsimsv2_10n"     # 处理后的数据输出目录
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -47,7 +47,8 @@ done
 CLIP_MODEL="ViT-g-14"
 CLIP_CKPT="./models/open_clip/vit_g14_laion2b/open_clip_pytorch_model.bin"
 WAVLM_PATH="./models/wavlm/wavlm-large"
-TEXT_MODEL_PATH="./models/sent/paraphrase-multilingual-mpnet-base-v2"
+TEXT_MODEL_PATH="./models/bert-base-chinese"
+# TEXT_MODEL_PATH="./models/sent/paraphrase-multilingual-mpnet-base-v2"
 
 # 处理参数
 DEVICE="cuda:0"
@@ -59,6 +60,9 @@ TARGET_SR=16000
 API_KEY="sk-CopXuPMUxmJY7UNSXrjyBA"
 BASE_URL="https://llm.rekeymed.com/v1/"
 MODEL_NAME="Qwen/Qwen3-Omni-30B-A3B"
+
+# 并行参数（MLLM调用优化）
+PARALLEL_WORKERS=4                        # MLLM并行调用数量（可根据API限制调整）
 
 # 提取模式：all=完整提取, basic=仅基本模态, social=仅社会关系, context=仅情境, prior=社会关系+情境
 EXTRACT_MODE="all"
@@ -79,11 +83,12 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$LOG_DIR/preprocess_${TIMESTAMP}.log"
 
 echo "========================================"
-echo "CH-SIMSV2S 数据集预处理"
+echo "CH-SIMSV2S 数据集预处理（支持并行MLLM）"
 echo "========================================"
 echo "输入目录: $INPUT_DIR"
 echo "输出目录: $OUTPUT_DIR"
 echo "提取模式: $EXTRACT_MODE"
+echo "MLLM并行数: $PARALLEL_WORKERS"
 echo "先验文本CSV: ${OUTPUT_DIR}/prior_texts/"
 echo "日志文件: $LOG_FILE"
 echo "========================================"
@@ -105,6 +110,7 @@ PREPROCESS_CMD=(
     --base_url $BASE_URL
     --model_name $MODEL_NAME
     --extract_mode $EXTRACT_MODE
+    --parallel_workers $PARALLEL_WORKERS
 )
 
 # 添加自定义提示词（如果设置了）

@@ -2,7 +2,7 @@
 set -e
 
 # ===== 用户手动控制区（只改这里） =====
-TAG_NAME="尝试对meld进行调参前"   
+TAG_NAME="加入KL散度之后，MELD上涨到0.61"   
 # 示例：
 # TAG_NAME="backup-2025-12-23"
 # TAG_NAME="pre-ijcai-2026"

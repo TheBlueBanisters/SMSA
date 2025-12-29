@@ -1,12 +1,17 @@
 #!/bin/bash
 
 # 模型仓库名称
-MODEL_NAME="laion/CLIP-ViT-g-14-laion2B-s12B-b42K"
-DIR_PATH="models/open_clip/vit_g14_laion2b"
+# MODEL_NAME="laion/CLIP-ViT-g-14-laion2B-s12B-b42K"
+# DIR_PATH="models/open_clip/vit_g14_laion2b"
+
+# 修改为 BERT 中文模型
+MODEL_NAME="google-bert/bert-base-chinese"
+DIR_PATH="models/bert-base-chinese"
 
 
 # 使用 HF Mirror 镜像站（国内访问更快）
-HF_ENDPOINT="https://hf-mirror.com"
+# HF_ENDPOINT="https://hf-mirror.com"
+HF_ENDPOINT="https://huggingface.com"
 
 # API 获取文件列表
 API_URL="${HF_ENDPOINT}/api/models/${MODEL_NAME}"

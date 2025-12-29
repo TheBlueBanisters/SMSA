@@ -44,6 +44,11 @@ class Mamba(nn.Module):
     - 因果卷积（短期依赖）
     - 选择性扫描（状态空间建模）
     - 输出投影
+    
+    ⭐ DSPS 扩展（条件化SSM）：
+    - 当 use_dsps=True 时，在 x_proj → dt/B/C 路径中注入条件信息
+    - 条件输入通过 dsps_proj 投影后加到 x_dbl 上，从而影响 dt/B/C 的生成
+    - 这是一种 parameter-conditioned dynamics，不修改 selective_scan 本身
     """
     def __init__(
         self,
@@ -63,6 +68,10 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        # ⭐ DSPS 参数
+        use_dsps=False,           # 是否启用 DSPS 条件化
+        dsps_cond_dim=None,       # 条件输入维度 (social_dim + context_dim)
+        dsps_strength=0.1,        # DSPS 强度因子（0.0=无效果，1.0=完全效果）
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -74,6 +83,11 @@ class Mamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 8) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
+        
+        # ⭐ DSPS 配置
+        self.use_dsps = use_dsps
+        self.dsps_cond_dim = dsps_cond_dim
+        self.dsps_strength = dsps_strength  # 强度因子（0.0=无效果，1.0=完全效果）
 
         # 输入投影层：d_model -> d_inner * 2
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
@@ -133,11 +147,31 @@ class Mamba(nn.Module):
 
         # 输出投影
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        
+        # ⭐ DSPS 条件投影层
+        # 将条件输入（如 social + context embedding）投影到与 x_dbl 相同的维度
+        # x_dbl 的维度是 dt_rank + d_state * 2
+        if self.use_dsps and self.dsps_cond_dim is not None:
+            dsps_out_dim = self.dt_rank + self.d_state * 2
+            self.dsps_proj = nn.Sequential(
+                nn.Linear(self.dsps_cond_dim, dsps_out_dim, **factory_kwargs),
+                nn.LayerNorm(dsps_out_dim, **factory_kwargs),
+                nn.Tanh(),  # 使用 Tanh 限制调制幅度，防止不稳定
+            )
+            # 初始化为接近零，确保初始状态接近原始 Mamba 行为
+            nn.init.zeros_(self.dsps_proj[0].weight)
+            nn.init.zeros_(self.dsps_proj[0].bias)
+        else:
+            self.dsps_proj = None
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, dsps_cond=None):
         """
         Args:
-            hidden_states: (B, L, D)
+            hidden_states: (B, L, D) 输入序列
+            inference_params: 推理参数（可选，用于增量解码）
+            dsps_cond: (B, cond_dim) DSPS条件输入（可选）
+                       当 use_dsps=True 且 dsps_cond 不为 None 时，
+                       条件信息会被注入到 dt/B/C 的生成路径中
         Returns: 
             out: (B, L, D)
         """
@@ -163,8 +197,23 @@ class Mamba(nn.Module):
                 activation=self.activation,
             )
 
-        # SSM
-        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        # SSM 参数生成
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (B*L, dt_rank + 2*d_state)
+        
+        # ⭐ DSPS 条件化注入
+        # 在 x_proj 输出之后、split 之前，将条件信息加到 x_dbl 上
+        # 这样条件信息会影响 dt/B/C 的生成，实现 parameter-conditioned dynamics
+        if self.use_dsps and self.dsps_proj is not None and dsps_cond is not None:
+            # dsps_cond: (B, cond_dim) -> 投影后: (B, dt_rank + 2*d_state)
+            cond_proj = self.dsps_proj(dsps_cond)  # (B, dt_rank + 2*d_state)
+            # 扩展到 (B*L, dt_rank + 2*d_state)，使每个时间步都受到相同的条件调制
+            cond_proj_expanded = cond_proj.unsqueeze(1).expand(-1, seqlen, -1)  # (B, L, dt_rank + 2*d_state)
+            cond_proj_expanded = rearrange(cond_proj_expanded, "b l d -> (b l) d")  # (B*L, dt_rank + 2*d_state)
+            # ⭐ 加性调制，应用强度因子
+            # dsps_strength=0.0 → 无效果（原始Mamba）
+            # dsps_strength=1.0 → 完全效果
+            x_dbl = x_dbl + self.dsps_strength * cond_proj_expanded
+        
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj.weight @ dt.t()
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
@@ -217,6 +266,9 @@ class Mamba(nn.Module):
 class Block(nn.Module):
     """
     Mamba Block 包装器，包含归一化和残差连接
+    
+    ⭐ DSPS 支持：forward 方法接受可选的 dsps_cond 参数，
+       并将其传递给内部的 Mamba mixer
     """
     def __init__(
         self, 
@@ -232,11 +284,14 @@ class Block(nn.Module):
         self.mixer = mixer_cls(dim)
         self.norm = norm_cls(dim)
 
-    def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None):
+    def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None, 
+                inference_params=None, dsps_cond=None):
         """
         Args:
             hidden_states: 输入序列
             residual: 残差（用于残差连接）
+            inference_params: 推理参数
+            dsps_cond: DSPS条件输入（可选）
         Returns:
             (hidden_states, residual)
         """
@@ -263,7 +318,8 @@ class Block(nn.Module):
                 residual = (hidden_states + residual) if residual is not None else hidden_states
                 hidden_states = self.norm(residual)
         
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+        # ⭐ 传递 dsps_cond 给 mixer (Mamba)
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params, dsps_cond=dsps_cond)
         return hidden_states, residual
 
 
@@ -277,13 +333,34 @@ def create_block(
     layer_idx=None,
     device=None,
     dtype=None,
+    # ⭐ DSPS 参数
+    use_dsps=False,
+    dsps_cond_dim=None,
+    dsps_strength=0.1,
 ):
-    """创建一个 Mamba Block"""
+    """创建一个 Mamba Block
+    
+    Args:
+        d_model: 模型维度
+        ssm_cfg: SSM 配置字典
+        use_dsps: 是否启用 DSPS 条件化
+        dsps_cond_dim: DSPS 条件输入维度
+        dsps_strength: DSPS 强度因子（0.0-1.0，默认0.1）
+    """
     if ssm_cfg is None:
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
     
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    # ⭐ 将 DSPS 参数传递给 Mamba
+    mixer_cls = partial(
+        Mamba, 
+        layer_idx=layer_idx, 
+        use_dsps=use_dsps,
+        dsps_cond_dim=dsps_cond_dim,
+        dsps_strength=dsps_strength,
+        **ssm_cfg, 
+        **factory_kwargs
+    )
     
     if rms_norm and RMSNorm is not None:
         norm_cls = partial(RMSNorm, eps=norm_epsilon, **factory_kwargs)

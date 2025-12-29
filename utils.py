@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from typing import Dict, Any, Optional, List
 from datetime import datetime
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error, balanced_accuracy_score
 from scipy.stats import pearsonr, ConstantInputWarning, NearConstantInputWarning
 
 # 尝试导入绘图库
@@ -317,13 +317,90 @@ class MetricsCalculator:
         num_classes = 7
         
         # 总体指标
+        # Weighted Accuracy: 按样本数量加权的准确率
+        # = Σ(每个类别的准确率 × 该类别的样本占比)
+        # 样本多的类别权重高，样本少的类别权重低
+        # 数学上等价于 recall_score(average='weighted')
+        weighted_acc = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+        
+        f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
+        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        # F1_weighted: 按样本数量加权的F1（样本越多权重越高）
+        f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        
+        metrics = {
+            'Acc': weighted_acc,  # Weighted Accuracy: 按样本数量加权（样本多的类别权重高）
+            'F1_micro': f1_micro,
+            'F1_macro': f1_macro,
+            'F1_weighted': f1_weighted,  # weighted F1
+        }
+        
+        # 计算每个类别的指标
+        # 获取每个类别的精确率、召回率、F1
+        precision_per_class = precision_score(y_true, y_pred, labels=range(num_classes), 
+                                               average=None, zero_division=0)
+        recall_per_class = recall_score(y_true, y_pred, labels=range(num_classes), 
+                                         average=None, zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, labels=range(num_classes), 
+                                 average=None, zero_division=0)
+        
+        # 计算每个类别的准确率（需要用混淆矩阵）
+        cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
+        # 每个类别的准确率 = 正确预测数 / 该类别的样本总数
+        class_totals = cm.sum(axis=1)  # 每个类别的真实样本数
+        class_correct = cm.diagonal()  # 每个类别正确预测的数量
+        
+        for i, name in enumerate(emotion_names):
+            # 每个类别的准确率（如果该类别没有样本，设为0）
+            if class_totals[i] > 0:
+                acc_i = class_correct[i] / class_totals[i]
+            else:
+                acc_i = 0.0
+            
+            metrics[f'Acc_{name}'] = acc_i
+            metrics[f'P_{name}'] = precision_per_class[i]
+            metrics[f'R_{name}'] = recall_per_class[i]
+            metrics[f'F1_{name}'] = f1_per_class[i]
+            metrics[f'Support_{name}'] = int(class_totals[i])
+        
+        return metrics
+    
+    @staticmethod
+    def calc_iemocap_metrics(y_pred: np.ndarray, y_true: np.ndarray) -> Dict[str, float]:
+        """
+        计算IEMOCAP数据集的4分类指标（包含每个类别的ACC和F1）
+        
+        IEMOCAP情感类别：
+        - 0: neutral（中性）
+        - 1: happy（快乐，包含excited）
+        - 2: sad（悲伤）
+        - 3: angry（愤怒）
+        
+        Args:
+            y_pred: 预测类别 [N]
+            y_true: 真实类别 [N]
+        Returns:
+            metrics: 包含总体指标和每个类别指标的字典
+        """
+        from sklearn.metrics import precision_score, recall_score, confusion_matrix
+        
+        # 情感类别名称
+        emotion_names = ['neutral', 'happy', 'sad', 'angry']
+        num_classes = 4
+        
+        # 总体指标
         acc = accuracy_score(y_true, y_pred)
         f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
         f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
         f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
         
+        # ⭐ Balanced Accuracy: 各类别 Recall 的简单平均
+        # 对于类别不平衡数据更公平，不受多数类主导
+        balanced_acc = balanced_accuracy_score(y_true, y_pred)
+        
         metrics = {
             'Acc': acc,
+            'Balanced_Acc': balanced_acc,  # ⭐ 平衡准确率
             'F1_micro': f1_micro,
             'F1_macro': f1_macro,
             'F1_weighted': f1_weighted,
@@ -607,6 +684,7 @@ class TrainingPlotter:
     
     # 指标配置：(显示名称, 是否越大越好)
     METRIC_CONFIG = {
+        # 回归任务指标
         'MAE': ('MAE', False),
         'mae': ('MAE', False),
         'Acc_2': ('Acc-2 (Binary)', True),
@@ -621,6 +699,12 @@ class TrainingPlotter:
         'F1_2': ('F1-2 (Binary)', True),
         'F1_3': ('F1-3 (Ternary)', True),
         'F1_5': ('F1-5 (5-Class)', True),
+        # 分类任务指标 (MELD/IEMOCAP)
+        'Acc': ('Accuracy', True),
+        'F1_weighted': ('F1 (Weighted)', True),
+        'F1_macro': ('F1 (Macro)', True),
+        'F1_micro': ('F1 (Micro)', True),
+        'Balanced_Acc': ('Balanced Accuracy', True),
     }
     
     # 绘图样式配置
