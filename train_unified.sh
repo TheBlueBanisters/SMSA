@@ -60,9 +60,9 @@ SEQ_LENGTH=""             # 留空使用数据集默认 (CH-SIMS/v2=70, MELD=80,
 BATCH_SIZE=""             # 留空使用数据集默认 (CH-SIMS=32, MELD=16)
 LEARNING_RATE="5e-5"          # 留空使用数据集默认 (MELD=5e-5)
 NUM_EPOCHS="150"          # 训练轮数
-HIDDEN_DIM="2048"             # 留空使用默认 256
-DROPOUT="0.1"                # 留空使用默认 (MELD=0.4)
-EARLY_STOP_PATIENCE="50"  # 早停等待轮数
+HIDDEN_DIM="4096"             # 留空使用默认 256
+DROPOUT="0.2"                # 留空使用默认 (MELD=0.4)
+EARLY_STOP_PATIENCE="20"  # 早停等待轮数
 EARLY_STOP_METRIC=""      # 留空自动选择 (Regression=mae, Classification=f1_weighted)
 SPHERE_LOSS_WEIGHT="0.001"
 
@@ -98,7 +98,7 @@ CHSIMSV2_MTL_LAMBDA="0.1"  # 辅助任务（单模态标签）的损失权重
                            # 建议范围：0.1 - 0.5
 
 # --- 超图建模（M3NET）参数 ---
-NUM_HG_LAYERS="2"            # 超图卷积层数（M3NET原始使用3层）
+NUM_HG_LAYERS="1"            # 超图卷积层数（M3NET原始使用3层）
 HG_USE_RESIDUE=true          # 拼接残差（M3NET原始方式）
 
 # --- 频域分解（GS-MCC / FGN）参数 ---
@@ -126,7 +126,7 @@ NO_COUPLED_MAMBA=false         # 关闭Coupled Mamba（使用独立Mamba）
 NO_MOE_FILM=true             # 关闭MoE-FiLM调制
 NO_HYPERGRAPH=false            # 关闭超图建模
                                # ⚠️ 启用超图建模(false)会自动启用对话级batching
-MAX_UTTERANCES_PER_BATCH=256   # ⭐ 每批最大utterance数（控制显存，防止OOM）
+MAX_UTTERANCES_PER_BATCH=64   # ⭐ 每批最大utterance数（控制显存，防止OOM）
 MAX_DIALOGUE_LEN=200           # 单个对话最大utterance数（超过的对话会被跳过）
 NO_FREQUENCY_DECOMP=false      # 关闭频域分解
 NO_SPHERE_REG=true         # 关闭超球体正则化
@@ -144,19 +144,19 @@ DSPS_STRENGTH=0.5              # DSPS强度因子（0.0=无效果，1.0=完全�
                                # 建议从0.1开始，根据实验调整
 
 # --- MLP架构选择 ---
-USE_IMPROVED_MLP=true
+USE_IMPROVED_MLP=false
          # ⭐ MLP架构选择（true=改进版，false=原始版）
                                # true=改进版：4层深层MLP + GELU + 残差 + LayerNorm（容量大，性能可能更好）
                                # false=原始版：2层简单MLP + ReLU（容量小，更稳定，当前使用）
-MLP_DROPOUT=0.1              # 改进版MLP的Dropout比例（默认0.2）
+MLP_DROPOUT=0.2              # 改进版MLP的Dropout比例（默认0.2）
 MLP_EXPANSION_RATIO=4        # 改进版MLP中间层扩维倍数（默认4，即中间层=输入×4）
 
 # --- 混合回放池 (Experience Replay) ---
 USE_REPLAY_BUFFER=true        # ⭐ 混合回放池开关
                                # true=启用（类似DQN的经验回放，关注高loss难样本）
                                # false=禁用（默认）
-REPLAY_BUFFER_THRESHOLD="1.3"  # Loss阈值倍数（batch_loss > avg_loss * threshold 时加入池）
-REPLAY_BUFFER_RATIO="0.3"      # 回放比例（每epoch额外训练20%的难样本batch）
+REPLAY_BUFFER_THRESHOLD="1.8"  # Loss阈值倍数（batch_loss > avg_loss * threshold 时加入池）
+REPLAY_BUFFER_RATIO="0.2"      # 回放比例（每epoch额外训练20%的难样本batch）
 REPLAY_BUFFER_MAX_SIZE="500"   # 回放池最大容量
 
 # --- 类别权重设置（分类任务） ---
@@ -185,7 +185,7 @@ USE_FOCAL_LOSS="true"              # Focal Loss 开关：
                             #   "" (留空) = 使用数据集默认配置（MELD默认开启）
                             #   true      = 强制开启 (loss_function=focal)
                             #   false     = 强制关闭 (loss_function=ce)
-FOCAL_LOSS_GAMMA="2.0"       # Focal Loss 的 gamma 参数（默认：2.0
+FOCAL_LOSS_GAMMA="5.0"       # Focal Loss 的 gamma 参数（默认：2.0
                             # 如果启用动态gamma，这是初始值
 
 # --- 动态 Focal Loss Gamma 衰减 (新功能) ---

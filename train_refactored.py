@@ -696,15 +696,31 @@ class Trainer:
             moe_loss_weight = getattr(self.config, 'moe_loss_weight', 0.0)
             
             # ⭐ CH-SIMSv2 MTL: 计算单模态辅助损失
+            # 使用各模态独立的embedding通过回归头预测各自的单模态标签
             mtl_loss = torch.tensor(0.0, device=loss.device)
             if mtl_lambda > 0 and labels_T is not None:
-                # 从 aux_outputs 获取单模态表示（如果模型支持）
-                # 目前先使用主预测作为所有模态的预测（简化版）
-                # TODO: 未来可在模型中添加专门的单模态预测头
-                loss_T = self.criterion(logits.squeeze(-1), labels_T.squeeze(-1))
-                loss_A = self.criterion(logits.squeeze(-1), labels_A.squeeze(-1))
-                loss_V = self.criterion(logits.squeeze(-1), labels_V.squeeze(-1))
-                mtl_loss = (loss_T + loss_A + loss_V) / 3.0
+                # 从 aux_outputs 获取单模态embedding
+                text_emb = aux_outputs.get('text_embedding', None)
+                audio_emb = aux_outputs.get('audio_embedding', None)
+                video_emb = aux_outputs.get('video_embedding', None)
+                
+                if text_emb is not None and audio_emb is not None and video_emb is not None:
+                    # 使用单模态embedding预测各自的单模态标签
+                    # 需要一个简单的回归预测（取embedding的L2范数或线性投影）
+                    # 简化版：使用embedding的均值作为预测值（归一化到[-1, 1]区间）
+                    # 更精确的方式需要在模型中添加专门的单模态回归头
+                    # ⭐ 修复：使用embedding的第一个维度的tanh作为预测（简化回归头）
+                    pred_T = torch.tanh(text_emb.mean(dim=-1, keepdim=True))   # [B, 1]
+                    pred_A = torch.tanh(audio_emb.mean(dim=-1, keepdim=True))  # [B, 1]
+                    pred_V = torch.tanh(video_emb.mean(dim=-1, keepdim=True))  # [B, 1]
+                    
+                    loss_T = self.criterion(pred_T.squeeze(-1), labels_T.squeeze(-1))
+                    loss_A = self.criterion(pred_A.squeeze(-1), labels_A.squeeze(-1))
+                    loss_V = self.criterion(pred_V.squeeze(-1), labels_V.squeeze(-1))
+                    mtl_loss = (loss_T + loss_A + loss_V) / 3.0
+                else:
+                    # 如果模型没有返回单模态embedding，跳过MTL损失
+                    self.logger.warning("⚠️ CH-SIMSv2 MTL: 模型未返回单模态embedding，跳过MTL损失")
             
             # ⭐ KL散度多任务学习 (GS-MCC): 计算单模态分类损失 + KL一致性损失
             kl_mtl_loss = torch.tensor(0.0, device=loss.device)
@@ -861,7 +877,41 @@ class Trainer:
                 moe_loss = aux_outputs.get('moe_loss', torch.tensor(0.0, device=loss.device))
                 moe_loss_weight = getattr(self.config, 'moe_loss_weight', 0.0)
                 
-                total_loss = loss + self.config.sphere_loss_weight * sphere_loss + moe_loss_weight * moe_loss
+                # ⭐ 修复：Replay Buffer也需要计算KL MTL损失，保持训练目标一致
+                replay_kl_mtl_loss = torch.tensor(0.0, device=loss.device)
+                use_kl_mtl = getattr(self.config, 'use_kl_mtl', False)
+                if use_kl_mtl and self.kl_criterion is not None:
+                    text_logits = aux_outputs.get('text_logits', None)
+                    audio_logits = aux_outputs.get('audio_logits', None)
+                    video_logits = aux_outputs.get('video_logits', None)
+                    
+                    if text_logits is not None and audio_logits is not None and video_logits is not None:
+                        kl_weight = getattr(self.config, 'kl_mtl_weight', 1.0)
+                        unimodal_weight = getattr(self.config, 'unimodal_loss_weight', 1.0)
+                        
+                        # 单模态分类损失
+                        labels_for_unimodal = labels.long().squeeze()
+                        unimodal_loss = (
+                            self.criterion(text_logits, labels_for_unimodal) +
+                            self.criterion(audio_logits, labels_for_unimodal) +
+                            self.criterion(video_logits, labels_for_unimodal)
+                        )
+                        
+                        # KL一致性损失
+                        soft_target = F.softmax(logits.detach(), dim=-1)
+                        text_log_prob = F.log_softmax(text_logits, dim=-1)
+                        audio_log_prob = F.log_softmax(audio_logits, dim=-1)
+                        video_log_prob = F.log_softmax(video_logits, dim=-1)
+                        
+                        kl_loss = (
+                            self.kl_criterion(text_log_prob, soft_target) +
+                            self.kl_criterion(audio_log_prob, soft_target) +
+                            self.kl_criterion(video_log_prob, soft_target)
+                        )
+                        
+                        replay_kl_mtl_loss = unimodal_weight * unimodal_loss + kl_weight * kl_loss
+                
+                total_loss = loss + self.config.sphere_loss_weight * sphere_loss + moe_loss_weight * moe_loss + replay_kl_mtl_loss
                 
                 # 反向传播
                 total_loss.backward()
